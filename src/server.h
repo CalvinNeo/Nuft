@@ -28,8 +28,8 @@ using grpc::CompletionQueue;
 // using raft_messages::RequestVoteResponse;
 // using raft_messages::RaftMessages
 
-
 struct RaftMessagesServiceImpl : public raft_messages::RaftMessages::Service {
+    // `RaftMessagesServiceImpl` defines what we do when receiving a RPC call.
     struct RaftNode * raft_node = nullptr;
 
     RaftMessagesServiceImpl(struct RaftNode * _raft_node) : raft_node(_raft_node) {
@@ -46,15 +46,18 @@ struct RaftMessagesServiceImpl : public raft_messages::RaftMessages::Service {
 
 
 struct RaftMessagesClientSync {
+    // `RaftMessagesClientSync` defines how to make a sync RPC call, and how to handle its results.
     using RequestVoteResponse = ::raft_messages::RequestVoteResponse;
     using RequestVoteRequest = ::raft_messages::RequestVoteRequest;
     using AppendEntriesRequest = ::raft_messages::AppendEntriesRequest;
     using AppendEntriesResponse = ::raft_messages::AppendEntriesResponse;
 
+    // Back reference to raft node.
     struct RaftNode * raft_node = nullptr;
+    std::shared_ptr<Nuke::ThreadExecutor> task_queue;
 
     void AsyncRequestVote(const RequestVoteRequest& request);
-    void AsyncAppendEntries(const AppendEntriesRequest& request);
+    void AsyncAppendEntries(const AppendEntriesRequest& request, bool heartbeat);
 
     RaftMessagesClientSync(const char * addr, struct RaftNode * _raft_node);
     RaftMessagesClientSync(const std::string & addr, struct RaftNode * _raft_node);
@@ -68,11 +71,13 @@ private:
 
 
 struct RaftMessagesClientAsync {
+    // `RaftMessagesClientAsync` defines how to make a async RPC call, and how to handle its results.
     using RequestVoteResponse = ::raft_messages::RequestVoteResponse;
     using RequestVoteRequest = ::raft_messages::RequestVoteRequest;
     using AppendEntriesRequest = ::raft_messages::AppendEntriesRequest;
     using AppendEntriesResponse = ::raft_messages::AppendEntriesResponse;
 
+    // Back reference to raft node.
     struct RaftNode * raft_node = nullptr;
 
     struct AsyncClientCallBase {
@@ -91,6 +96,7 @@ struct RaftMessagesClientAsync {
     void AsyncRequestVote(const RequestVoteRequest& request)
     {
         // Call will be removed from CompletionQueue
+        // debug("GRPC sending AppendRequestVote\n");
         AsyncClientCall<RequestVoteResponse> * call = new AsyncClientCall<RequestVoteResponse>();
         call->type = 1;
         call->response_reader = stub->AsyncRequestVote(&call->context, request, &cq);
@@ -99,6 +105,7 @@ struct RaftMessagesClientAsync {
 
     void AsyncAppendEntries(const AppendEntriesRequest& request)
     {
+        // debug("GRPC sending AppendEntries\n");
         AsyncClientCall<AppendEntriesResponse> * call = new AsyncClientCall<AppendEntriesResponse>();
         call->type = 2;
         call->response_reader = stub->AsyncAppendEntries(&call->context, request, &cq);

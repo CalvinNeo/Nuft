@@ -3,9 +3,22 @@
 #include <vector>
 #include <unistd.h>
 #include <cstdlib>
+#include <signal.h>
+#include <cstdio>
 
+void sigint_handler(){
+    fflush(stdout);
+    fflush(stderr);
+    exit(0);
+}
+
+#define BUFFERSIZE 2048
+char buffer[BUFFERSIZE];
 char tmp[1024];
 int main(int argc, char *argv[]) {
+    sigset(SIGINT, sigint_handler);
+    sigset(SIGTERM, sigint_handler);
+
     int oc;
     int node_line = -1;
     std::vector<std::string> vec;
@@ -14,7 +27,7 @@ int main(int argc, char *argv[]) {
         switch (oc)
         {
         case 'f':
-            sscanf(optarg, "%s", &tmp);
+            sscanf(optarg, "%s", tmp);
             break;
         case 'i':
             sscanf(optarg, "%d", &node_line);
@@ -41,5 +54,9 @@ int main(int argc, char *argv[]) {
         }
     }
     node->start();
+    while(~scanf("%s", buffer)){
+        printf("===\n");
+        node->do_log(std::string(buffer));
+    }
     node->raft_message_server->server->Wait();
 }

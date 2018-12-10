@@ -34,3 +34,15 @@
 /bin
 /logs
 *.pb.*
+*.log
+*.tags*
+*.gcov
+*.gcda
+*.gcno
+*.info
+core
+tags
+*.swp
+*.swo
+*.pyc
+*.err

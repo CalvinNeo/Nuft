@@ -8,13 +8,18 @@ cov_lnk = -fprofile-arcs -ftest-coverage --coverage -fno-inline
 
 NO_WARN = -w
 TRIM_WARN = -Wno-unused-variable -Wno-unused-but-set-variable -Wformat-security
-CFLAGS = -DPOSIX -fpermissive -std=c++1z -std=c++1z -L/usr/local/lib
+GDB_INFO = -g
+CFLAGS = -DPOSIX -fpermissive -std=c++1z -L/usr/local/lib $(GDB_INFO)
 GRPC_PKGCONFIG = `pkg-config --libs protobuf grpc++ grpc` 
 ifeq ($(SYSTEM),Darwin)
 LDFLAGS += -DGRPC_VERBOSITY=DEBUG -DGRPC_TRACE=all $(GRPC_PKGCONFIG) -lgrpc++_reflection -ldl 
 else
 LDFLAGS += -DGRPC_VERBOSITY=DEBUG -DGRPC_TRACE=all $(GRPC_PKGCONFIG) -Wl,--no-as-needed -lgrpc++_reflection -Wl,--as-needed -ldl
 endif
+
+LOG_LEVEL_NOTICE_MAJOR = -D_HIDE_HEARTBEAT_NOTICE -D_HIDE_GRPC_NOTICE
+LOG_LEVEL = -D_HIDE_HEARTBEAT_NOTICE 
+CFLAGS += $(LOG_LEVEL)
 
 OBJ_EXT=o
 
@@ -29,19 +34,21 @@ OBJS = $(patsubst $(SRC_ROOT)%, $(OBJ_ROOT)%, $(patsubst %cpp, %o, $(SRCS)))
 GRPCSRCS = $(wildcard $(SRC_ROOT)/grpc/*.cc)
 GRPCOBJS = $(patsubst $(SRC_ROOT)%, $(OBJ_ROOT)%, $(patsubst %cc, %o, $(GRPCSRCS)))
 
+all: 
+	make grpc_source
+	make test
 
-all: $(OBJ_ROOT)/grpc node2 
+test: $(GRPCOBJS)
+	$(CXX) $(GRPCOBJS) $(CFLAGS) $(LDFLAGS) -Isrc/grpc $(SRCS) $(SRC_ROOT)/test/test.cpp -o $(ROOT)/test -lpthread /usr/local/lib/libgtest.a 
 
+run_cluster:
+	python $(SRC_ROOT)/test/run_cluster.py
 
-onlycpp: $(GRPCOBJS)
-	g++ $(GRPCOBJS) $(CFLAGS) $(LDFLAGS) -Isrc/grpc $(SRCS) -o $(BIN_ROOT)/node
-
-node2: grpc_source $(GRPCOBJS)
-	g++ $(GRPCOBJS) $(CFLAGS) $(LDFLAGS) -Isrc/grpc $(SRCS) -o $(BIN_ROOT)/node
-
+node: $(GRPCOBJS)
+	$(CXX) $(GRPCOBJS) $(CFLAGS) $(LDFLAGS) -Isrc/grpc $(SRCS) $(SRC_ROOT)/test/test.cpp -o $(BIN_ROOT)/node
 
 $(OBJ_ROOT)/%.o: $(SRC_ROOT)/%.cc $(OBJ_ROOT)/grpc 
-	g++ $(CFLAGS) -pthread -I/usr/local/include -c -o $@ $<
+	$(CXX) $(CFLAGS) -pthread -I/usr/local/include -c -o $@ $<
 
 grpc_source:
 	protoc -I $(SRC_ROOT)/grpc --grpc_out=$(SRC_ROOT)/grpc --plugin=protoc-gen-grpc=`which grpc_cpp_plugin` $(SRC_ROOT)/grpc/raft_messages.proto
@@ -56,10 +63,21 @@ $(OBJ_ROOT):
 debug:
 	export GRPC_TRACE=all
 
-.PHONY: clean
+.PHONY: clean clc
 clean:
 	rm -rf $(BIN_ROOT)
 	rm -f core
+	rm ./test
+
+.PHONY: clc
+clc:
+	rm -f *.err
+	rm -f *.out
+	
+.PHONY: clean2
+clean2: clean
+	rm -rf $(SRC_ROOT)/grpc/*.pb.*
+	
 
 list:
 	@echo $(SRCS)
