@@ -1,6 +1,12 @@
 #include <map>
+#include <algorithm>
 
 namespace Nuke{
+template<typename C, typename K>
+bool contains(C c, const K & key){
+    return std::find(c.begin(), c.end(), key) != std::end(c);
+}
+
 template<typename K, typename V>
 bool contains(std::map<K, V> mp, const K & key){
     typename std::map<K, V>::const_iterator iter = mp.find(key);

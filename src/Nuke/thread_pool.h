@@ -37,11 +37,7 @@ struct ThreadExecutor{
     }
 
     ~ThreadExecutor(){
-        for (size_t i = 0; i < capacity; i++){
-            if(ths[i].joinable()){
-                ths[i].detach();
-            }
-        }
+        wait();
         delete [] ths;
     }
 
@@ -57,11 +53,21 @@ struct ThreadExecutor{
     }
 
     void wait(){
+        stop();
         for (size_t i = 0; i < capacity; i++){
-            ths[i].join();
+            if(ths[i].joinable()){
+                ths[i].join();
+            }
         }
     }
 
+    void detach(){
+        for (size_t i = 0; i < capacity; i++){
+            if(ths[i].joinable()){
+                ths[i].detach();
+            }
+        }
+    }
     std::thread * ths;
     std::vector<Task> tasks;
     std::mutex mut;
