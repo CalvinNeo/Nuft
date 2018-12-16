@@ -10,10 +10,10 @@
 #include <functional>
 #include <vector>
 
-#define debug printf
-
 #include "Nuke/thread_pool.h"
 #include "Nuke/lang_extend.h"
+#include "Nuke/log.h"
+#include "Nuke/string_utils.h"
 
 inline uint64_t get_current_ms() {
     using namespace std::chrono;
@@ -31,3 +31,12 @@ inline uint64_t get_ranged_random(uint64_t fr, uint64_t to) {
     static std::uniform_int_distribution<uint64_t> dist(fr, to);
     return dist(engine);
 }
+
+struct RaftNodeLogger{
+    struct RaftNode * node;
+    void dolog(RaftNodeLogger & context, char const * file_name, char const * func_name, int line, int level, char const * fmt, va_list va);
+};
+
+#define LOGLEVEL_DEBUG 5
+// #define debug NUKE_LOG
+#define debug printf

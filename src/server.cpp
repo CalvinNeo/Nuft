@@ -65,7 +65,7 @@ void RaftMessagesClientAsync::AsyncCompleteRpc()
 }
 
 
-RaftMessagesClientAsync::RaftMessagesClientAsync(const char * addr, struct RaftNode * _raft_node) : raft_node(_raft_node) {
+RaftMessagesClientAsync::RaftMessagesClientAsync(const char * addr, struct RaftNode * _raft_node) : raft_node(_raft_node), peer_name(addr) {
     std::shared_ptr<Channel> channel = grpc::CreateChannel(addr, grpc::InsecureChannelCredentials());
     debug("Create channel from host %s to remote %s\n", raft_node->name.c_str(), addr);
     stub = raft_messages::RaftMessages::NewStub(channel);
@@ -82,17 +82,22 @@ void RaftMessagesClientSync::AsyncRequestVote(const RequestVoteRequest& request)
 {
     // A copy of `request` is needed
     // TODO Replace `std::thread` implementation with future.then implementation. 
+    std::string peer_name = this->peer_name;
+    struct RaftNode * raft_node = this->raft_node;
 #if defined(USE_GRPC_SYNC_BARE)
     std::thread t = std::thread(
 #else
     task_queue->add_task(
 #endif
-    [this, request](){ 
+    [this, request, peer_name, raft_node](){ 
         RequestVoteResponse response;
         ClientContext context;
         Status status = this->stub->RequestVote(&context, request, &response);
         if (status.ok()) {
-            this->raft_node->on_vote_response(response);
+            // Test whether raft_node_>peers[peer_name] is destructed.
+            if(Nuke::contains(raft_node->peers, peer_name)){
+                this->raft_node->on_vote_response(response);
+            }
         } else {
             #if !defined(_HIDE_GRPC_NOTICE)
             debug("GRPC error %d: %s\n", status.error_code(), status.error_message().c_str());
@@ -109,17 +114,21 @@ void RaftMessagesClientSync::AsyncRequestVote(const RequestVoteRequest& request)
 
 void RaftMessagesClientSync::AsyncAppendEntries(const AppendEntriesRequest& request, bool heartbeat)
 {
+    std::string peer_name = this->peer_name;
+    struct RaftNode * raft_node = this->raft_node;
 #if defined(USE_GRPC_SYNC_BARE)
     std::thread t = std::thread(
 #else
     task_queue->add_task(
 #endif
-    [this, heartbeat, request](){
+    [this, heartbeat, request, peer_name, raft_node](){
         AppendEntriesResponse response;
         ClientContext context;
         Status status = this->stub->AppendEntries(&context, request, &response);
         if (status.ok()) {
-            this->raft_node->on_append_entries_response(response, heartbeat);
+            if(Nuke::contains(raft_node->peers, peer_name)){
+                this->raft_node->on_append_entries_response(response, heartbeat);
+            }
         } else {
             #if !defined(_HIDE_GRPC_NOTICE)
             if(!heartbeat) debug("GRPC error %d: %s\n", status.error_code(), status.error_message().c_str());
@@ -135,9 +144,11 @@ void RaftMessagesClientSync::AsyncAppendEntries(const AppendEntriesRequest& requ
 }
 
 
-RaftMessagesClientSync::RaftMessagesClientSync(const char * addr, struct RaftNode * _raft_node) : raft_node(_raft_node) {
+RaftMessagesClientSync::RaftMessagesClientSync(const char * addr, struct RaftNode * _raft_node) : raft_node(_raft_node), peer_name(addr) {
     std::shared_ptr<Channel> channel = grpc::CreateChannel(addr, grpc::InsecureChannelCredentials());
+#if !defined(_HIDE_GRPC_NOTICE)
     debug("GRPC: Create channel between host %s and remote %s\n", raft_node->name.c_str(), addr);
+#endif
     stub = raft_messages::RaftMessages::NewStub(channel);
 }
 
@@ -148,7 +159,9 @@ RaftMessagesClientSync::RaftMessagesClientSync(const std::string & addr, struct 
 
 RaftServerContext::RaftServerContext(struct RaftNode * node){
     service = new RaftMessagesServiceImpl(node);
+#if !defined(_HIDE_GRPC_NOTICE)
     debug("GRPC: Listen to %s\n", node->name.c_str());
+#endif
     builder = new ServerBuilder();
     builder->AddListeningPort(node->name, grpc::InsecureServerCredentials());
     builder->RegisterService(service);

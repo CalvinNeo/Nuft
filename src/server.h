@@ -55,6 +55,7 @@ struct RaftMessagesClientSync {
     // Back reference to raft node.
     struct RaftNode * raft_node = nullptr;
     std::shared_ptr<Nuke::ThreadExecutor> task_queue;
+    std::string peer_name;
 
     void AsyncRequestVote(const RequestVoteRequest& request);
     void AsyncAppendEntries(const AppendEntriesRequest& request, bool heartbeat);
@@ -79,6 +80,7 @@ struct RaftMessagesClientAsync {
 
     // Back reference to raft node.
     struct RaftNode * raft_node = nullptr;
+    std::string peer_name;
 
     struct AsyncClientCallBase {
         char type;
