@@ -44,4 +44,20 @@ inline std::vector<std::string> split(const std::string & s, const std::string &
     return res;
 }
 
+template<typename Iter>
+inline std::string join(Iter b, Iter e, const std::string & combine){
+    return std::accumulate(b, e, std::string(""), [&](const auto & x, const auto & y){return x == "" ? y : x + combine + y;});
+}
+template<typename Iter, typename F>
+inline std::string join(Iter b, Iter e, const std::string & combine, F f){
+    std::string s;
+    for(auto i = b; i != e; i++){
+        if(i != b){
+            s += combine;
+        }
+        s += f(*i);
+    }
+    return s;
+}
+
 }

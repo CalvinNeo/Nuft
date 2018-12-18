@@ -41,6 +41,7 @@
 *.gcno
 *.info
 core
+core*
 tags
 *.swp
 *.swo

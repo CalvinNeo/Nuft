@@ -167,3 +167,9 @@ RaftServerContext::RaftServerContext(struct RaftNode * node){
     builder->RegisterService(service);
     server = std::unique_ptr<Server>{builder->BuildAndStart()};
 }
+RaftServerContext::~RaftServerContext(){
+    debug("Server destructing.\n");
+    delete service;
+    delete builder;
+    debug("Server destructed.\n");
+}

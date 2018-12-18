@@ -133,9 +133,5 @@ struct RaftServerContext{
     std::unique_ptr<Server> server;
     ServerBuilder * builder;
     RaftServerContext(struct RaftNode * node);
-    ~RaftServerContext(){
-        debug("Server destructed.\n");
-        delete service;
-        delete builder;
-    }
+    ~RaftServerContext();
 };

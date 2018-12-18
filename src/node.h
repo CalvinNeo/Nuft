@@ -28,12 +28,6 @@ static constexpr uint64_t default_election_fail_timeout_interval = 3000; //
 
 #define GUARD
 #define GUARD std::lock_guard<std::mutex> guard((mut));
-#define LOCK mut.lock();
-#define UNLOCK mut.unlock();
-
-struct Log {
-
-};
 
 #if defined(USE_GRPC_ASYNC)
 #undef USE_GRPC_SYNC
@@ -58,7 +52,9 @@ struct NodePeer {
     IndexID match_index = default_index_cursor;
     // Use `RaftMessagesClient` to send RPC message to peer.
     RaftMessagesClient * raft_message_client = nullptr;
-    bool running = true;
+    // Debug usage
+    bool receive_enabled = true;
+    bool send_enabled = true;
     // According to the Raft Paper Chapter 6 Issue 1,
     // Newly added nodes is in staging mode, and thet have no voting rights,
     // Until they are sync-ed.
@@ -79,6 +75,7 @@ enum NUFT_CB_TYPE {
     NUFT_CB_ON_APPLY,
     NUFT_CB_CONF_START,
     NUFT_CB_CONF_END,
+    NUFT_CB_ON_REPLICATE,
     NUFT_CB_SIZE,
 };
 struct NuftCallbackArg{
@@ -91,13 +88,6 @@ typedef int NuftResult;
 // typedef std::function<NuftResult(NUFT_CB_TYPE, NuftCallbackArg *)> NuftCallbackFunc;
 typedef std::function<NuftResult(NUFT_CB_TYPE, NuftCallbackArg *)> NuftCallbackFunc;
 
-enum NUFT_CONF_STATE{
-    // ref liblogcabin/Raft/RaftConsensus.h, Configuation::State
-    NUFT_CONF_BLANK,
-    NUFT_CONF_STABLE,
-    NUFT_CONF_STAGING,
-    NUFT_CONF_TRANS,
-};
 
 struct RaftNode {
     enum NodeState {
@@ -145,12 +135,12 @@ struct RaftNode {
         }
         static std::string to_string(const Configuration & conf){
             std::string conf_str;
-            conf_str += std::accumulate(conf.app.begin(), conf.app.end(), std::string(""), [](const auto & x, const auto & y){return x == "" ? y : x + ";" + y;}) + "\n";
-            conf_str += std::accumulate(conf.rem.begin(), conf.rem.end(), std::string(""), [](const auto & x, const auto & y){return x == "" ? y : x + ";" + y;}) + "\n";
-            conf_str += std::accumulate(conf.old.begin(), conf.old.end(), std::string(""), [](const auto & x, const auto & y){return x == "" ? y : x + ";" + y;}) + "\n";
+            conf_str += Nuke::join(conf.app.begin(), conf.app.end(), ";") + "\n";
+            conf_str += Nuke::join(conf.rem.begin(), conf.rem.end(), ";") + "\n";
+            conf_str += Nuke::join(conf.old.begin(), conf.old.end(), ";") + "\n";
             return conf_str; 
         }
-		Configuration(const std::vector<std::string> & a, const std::vector<std::string> & r, const std::vector<NodeName> & o) : app(a), rem(r), old(o){
+        Configuration(const std::vector<std::string> & a, const std::vector<std::string> & r, const std::vector<NodeName> & o) : app(a), rem(r), old(o){
             
         }
 		Configuration(const std::vector<std::string> & a, const std::vector<std::string> & r, const std::map<NodeName, NodePeer> & o, const NodeName & leader_exclusive) : app(a), rem(r){
@@ -170,29 +160,31 @@ struct RaftNode {
                     newvote_thres--;
                 }
             }
-		}
+        }
         std::vector<std::string> app;
         std::vector<std::string> rem;
         std::vector<std::string> old;
         // If `commit_index >= index`, then C_{old,new} is comitted.
         IndexID index = -1;
-        // If `commit_index >= index2`, then C_{new} Configuation is comitted.
+        // If `commit_index >= index2`, then C_{new} Configuration is comitted.
         IndexID index2 = -1;
         size_t oldvote_thres = 0;
         size_t newvote_thres = 0;
-        bool is_staging() const{
+        enum State{
+            // This state means `trans_conf == nullptr`.
+            BLANK,
             // In staging period, no entries are logged.
-            return (index == -1) && (index2 == -1);
-        }
-        bool is_old_joint() const{
-            // Now entry for joint consensus are sent, but not committed.
-            return (index != -1) && (index2 == -1);
-        }
-        bool is_joint_new() const{
-            // Now joint consensus commited, and new configuration are sent.
+            STAGING,
+            // Now entry for joint consensus is logged, but not committed.
+            OLD_JOINT,
+            // Now entry for joint consensus is committed.
+            JOINT,
+            // Now entry for new configuration are sent.
             // ref update_configuration_new
-            return (index == -1) && (index2 != -1);
-        }
+            JOINT_NEW,
+            NEW,
+        };
+        State state = STAGING;
         bool is_in_old(const std::string & peer_name) const {
             return Nuke::contains(old, peer_name); 
         }
@@ -227,7 +219,6 @@ struct RaftNode {
     uint64_t last_tick = 0; // Reset every `default_heartbeat_interval`
     uint64_t elect_timeout_due = 0; // At this point the Follower start election
     uint64_t election_fail_timeout_due = 0; // At this point the Candidate's election timeout
-    NUFT_CONF_STATE conf_state = NUFT_CONF_BLANK;
 
     // Candidate exclusive
     size_t vote_got = 0;
@@ -245,7 +236,7 @@ struct RaftNode {
 
     // Utils
     // Multiple thread can access the same object, use mutex for protection.
-    std::mutex mut;
+    mutable std::mutex mut;
 
     // API
     NuftCallbackFunc callbacks[NUFT_CB_SIZE];
@@ -301,7 +292,8 @@ struct RaftNode {
         if (!is_running()) return;
         if ((state == NodeState::Leader) && current_ms >= default_heartbeat_interval + last_tick) {
             // Leader's routine heartbeat
-            send_heartbeat();
+            GUARD
+            send_heartbeat(guard);
             last_tick = current_ms;
         }
         // Check if leader is timeout
@@ -342,7 +334,6 @@ struct RaftNode {
         if (state != NodeState::NotRunning) {
             return;
         }
-        GUARD
         raft_message_server = new RaftServerContext(this);
         state = NodeState::Follower;
         reset_election_timeout();
@@ -352,30 +343,41 @@ struct RaftNode {
         debug_node("Stop node of %s\n", name.c_str());
         paused = true;
     }
-
     void resume() {
         paused = false;
         debug_node("Resume node of %s\n", name.c_str());
     }
-
-    void stop_ignore_peer(const std::string & peer_name){
-        if(Nuke::contains(peers, peer_name)){
-            peers[peer_name].running = true;
-        }
-    }
-    void ignore_peer(const std::string & peer_name){
-        // Only for debug usage.
-        // Ignore RPC request from peer.
-        if(Nuke::contains(peers, peer_name)){
-            peers[peer_name].running = false;
-        }
-    }
     bool is_running() const{
         return (state != NodeState::NotRunning) && (!paused);
     }
-    bool is_running(const std::string & peer_name) const{
+
+    void enable_receive(const std::string & peer_name){
+        if(Nuke::contains(peers, peer_name)){
+            peers[peer_name].receive_enabled = true;
+        }
+    }
+    void disable_receive(const std::string & peer_name){
+        if(Nuke::contains(peers, peer_name)){
+            peers[peer_name].receive_enabled = false;
+        }
+    }
+    void enable_send(const std::string & peer_name){
+        if(Nuke::contains(peers, peer_name)){
+            peers[peer_name].send_enabled = true;
+        }
+    }
+    void disable_send(const std::string & peer_name){
+        if(Nuke::contains(peers, peer_name)){
+            peers[peer_name].send_enabled = false;
+        }
+    }
+    bool is_peer_receive_enabled(const std::string & peer_name) const{
         if(!Nuke::contains(peers, peer_name)) return false;
-        return peers[peer_name].running;
+        return peers[peer_name].receive_enabled;
+    }
+    bool is_peer_send_enabled(const std::string & peer_name) const{
+        if(!Nuke::contains(peers, peer_name)) return false;
+        return peers[peer_name].send_enabled;
     }
 
     void reset_election_timeout() {
@@ -391,13 +393,14 @@ struct RaftNode {
         election_fail_timeout_due = UINT64_MAX;
     }
 
-    NodePeer & add_peer(const std::string & peer_name) {
+    NodePeer & add_peer(std::lock_guard<std::mutex> & guard, const std::string & peer_name) {
         //TODO Bad idea to return this reference, use `unique_ptr` later
         if (Nuke::contains(peers, peer_name)) {
             debug_node("Peer %s already found.\n", peer_name.c_str());
         } else {
             peers[peer_name] = NodePeer{peer_name};
-            peers[peer_name].running = true;
+            peers[peer_name].send_enabled = true;
+            peers[peer_name].receive_enabled = true;
             peers[peer_name].raft_message_client = new RaftMessagesClient(peer_name, this);
 #if defined(USE_GRPC_SYNC) && !defined(USE_GRPC_SYNC_BARE)
             peers[peer_name].raft_message_client->task_queue = sync_client_task_queue;
@@ -405,16 +408,24 @@ struct RaftNode {
         }
         return peers[peer_name];
     }
-    
-    void remove_peer(const std::string & peer_name){
+    void remove_peer(std::lock_guard<std::mutex> & guard, const std::string & peer_name){
         // Must under the protection of mutex
         if(Nuke::contains(peers, peer_name)){
             debug_node("Remove %s from cluster.\n", peer_name.c_str());
-            peers[peer_name].running = false;
+            peers[peer_name].send_enabled = false;
+            peers[peer_name].receive_enabled = false;
             delete peers[peer_name].raft_message_client;
             peers[peer_name].raft_message_client = nullptr;
             peers.erase(peer_name);
         }
+    }
+    NodePeer & add_peer(const std::string & peer_name) {
+        GUARD
+        return add_peer(guard, peer_name);
+    }
+    void remove_peer(const std::string & peer_name){
+        GUARD
+        return remove_peer(guard, peer_name);
     }
 
     void do_apply() {
@@ -427,10 +438,10 @@ struct RaftNode {
         invoke_callback(NUFT_CB_STATE_CHANGE, {this, o});
     }
 
-    void send_heartbeat() {
+    void send_heartbeat(std::lock_guard<std::mutex> & guard) {
         // TODO: optimize for every peer:
         // If already sent logs, don't do heartbeat this time.
-        do_append_entries(true);
+        do_append_entries(guard, true);
     }
 
     void become_follower(TermID new_term) {
@@ -459,6 +470,7 @@ struct RaftNode {
             // "When a leader first comes to power,
             // it initializes all nextIndex values to the index just after the
             // last one in its log."
+#define USE_COMMIT_INDEX
 #if !defined(USE_COMMIT_INDEX)
             pp.second.next_index = logs.size();
 #else
@@ -488,6 +500,7 @@ struct RaftNode {
         elect_timeout_due = UINT64_MAX;
 
         for (auto & pp : peers) {
+            if(!pp.second.send_enabled) continue;
             raft_messages::RequestVoteRequest request;
             request.set_name(name);
             request.set_term(current_term);
@@ -506,16 +519,15 @@ struct RaftNode {
         // When receive a `RequestVoteRequest` from peer.
 
         std::string peer_name = request.name();
-        if((!is_running()) || (!is_running(peer_name))){
+        if((!is_running()) || (!is_peer_receive_enabled(peer_name))){
         #if !defined(_HIDE_PAUSED_NODE_NOTICE)
             debug_node("Ignore RequestVoteRequest from %s, because (%s/%s) is not running.\n", request.name().c_str(), 
-                    is_running()?"":"I", is_running(peer_name)?"":peer_name.c_str());
+                    is_running()?"":"I", is_peer_receive_enabled(peer_name)?"":peer_name.c_str());
         #endif
             return -1;
         }
         GUARD
         
-        leader_name = "";
             
         raft_messages::RequestVoteResponse & response = *response_ptr;
         response.set_name(name);
@@ -531,7 +543,7 @@ struct RaftNode {
             // They will then send RequestVote RPCs with new term numbers, and this will cause the current leader to revert to follower state."
             become_follower(request.term());
             // We can't assume the sender has won the election.
-            // Error: leader_name = request.name();
+            // So we can't set leader_name.
             reset_election_timeout();
             invoke_callback(NUFT_CB_ELECTION_END, {this, state==NodeState::Candidate?ELE_FAIL:ELE_SUC_OB});
         } else if (request.term() < current_term) {
@@ -555,6 +567,7 @@ struct RaftNode {
             goto end;
         }
 
+        leader_name = "";
         // Vote.
         vote_for = request.name();
         response.set_vote_granted(true);
@@ -605,18 +618,18 @@ end:
         }
     }
 
-    void do_append_entries(bool heartbeat) {
+    void do_append_entries(std::lock_guard<std::mutex> & guard, bool heartbeat) {
         // Send `AppendEntriesRequest` to all peer.
         // When heartbeat is set to true, this function will NOT send logs, even if there are some updates.
         // If you believe the logs are updated and need to be notified to peers, then you must set `heartbeat` to false.
-
-        GUARD
         for (auto & pp : this->peers) {
+            if(!pp.second.send_enabled) continue;
             NodePeer & peer = pp.second;
             // We copy log entries to peer, from `prev_log_index`.
             // This may fail when "an existing entry conflicts with a new one (same index but different terms)"
             IndexID prev = peer.next_index - 1;
             IndexID prev_log_index = prev;
+            // TODO What if logs[prev] not exist?
             TermID prev_log_term = prev > default_index_cursor ? logs[prev].term() : default_term_cursor;
             raft_messages::AppendEntriesRequest request;
             request.set_name(name);
@@ -653,14 +666,14 @@ end:
         // When a Follower/Candidate receive `AppendEntriesResponse` from Leader,
         // Try append entries, then return a `AppendEntriesResponse`.
         std::string peer_name = request.name();
-        if((!is_running()) || (!is_running(peer_name))){
+        if((!is_running()) || (!is_peer_receive_enabled(peer_name))){
             #if !defined(_HIDE_NOEMPTY_REPEATED_APPENDENTRY_REQUEST) && !defined(_HIDE_PAUSED_NODE_NOTICE)
             #if defined(_HIDE_HEARTBEAT_NOTICE)
             if(request.entries().size() == 0){}else
             #endif
             debug_node("Ignore AppendEntriesRequest from %s by %s, because {%s/%s} is not running.\n", 
                     request.name().c_str(), name.c_str(), paused?"I":"", 
-                    !Nuke::contains(peers, peer_name)||!peers[peer_name].running?"peer":"");
+                    is_peer_receive_enabled(peer_name)?"peer":"");
             #endif
             return -1;
         }
@@ -671,13 +684,14 @@ end:
 
         IndexID prev_i = request.prev_log_index(), prev_j = 0;
 
-        // Leader is still alive
-        reset_election_timeout();
-
         if (request.term() < current_term) {
             debug_node("Reject AppendEntriesRequest from %s, because it has older term %llu, me %llu.\n", request.name().c_str(), request.term(), current_term);
             goto end;
         }
+
+        // **Current** Leader is still alive.
+        // We can't reset_election_timeout by a out-dated AppendEntriesRPC.
+        reset_election_timeout();
 
         if (request.term() > current_term) {
             // Discover a request with newer term.
@@ -707,18 +721,22 @@ end:
 
         // `request.prev_log_index() == -1` happens at the very beginning when a Leader with no Log, and send heartbeats to others.
         if (request.prev_log_index() >= 0 && request.prev_log_index() >= logs.size()) {
-            // I don't actually have the `prev_log_index()`,
-            // Failed.
+            // I don't have the `prev_log_index()` entry.
             debug_node("AppendEntries fail because I don't have prev_log_index = %llu, my log size = %llu.\n", request.prev_log_index(), logs.size());
             goto end;
         }
-
+        if(request.prev_log_index() >= 0 && request.prev_log_index() + 1 < logs.size()){
+            // I have some log entries(from former Leader), which current Leader don't have.
+            debug_node("My logs.size-1 = %u > request.prev_log_index() = %lld. Maybe still probing, maybe condition 5.4.2(b)\n", logs.size()-1, request.prev_log_index());
+            // logs.erase(logs.begin() + request.prev_log_index(), logs.end());
+            // goto end;
+        }
         if (request.prev_log_index() >= 0 && logs[request.prev_log_index()].term() != request.prev_log_term()) {
             // "If an existing entry conflicts with a new one (same index but different terms),
             // delete the existing entry and all that follow it"
             assert(commit_index < request.prev_log_index());
-            debug_node("AppendEntries fail because my term[prev_log_index=%lld] = %llu, Leader's = %llu.\n", request.prev_log_index(),
-                logs[request.prev_log_index()].term(), request.prev_log_term());
+            debug_node("AppendEntries fail because my term[prev_log_index=%lld] = %llu. Leader's prev_log_term= %llu, prev_log_index = %lld, commit = %lld. Do erase from Leader's prev_log_index to end.\n", 
+                request.prev_log_index(), logs[request.prev_log_index()].term(), request.prev_log_term(), request.prev_log_index(), request.leader_commit());
             logs.erase(logs.begin() + request.prev_log_index(), logs.end());
             goto end;
         }
@@ -755,13 +773,22 @@ end:
             }
         }
 
-        // Handle Configuration Changes
+        // When received Configuration entry 
         for(IndexID i = IndexID(logs.size()) - 1; i >= std::max((IndexID)0, prev_i); i--){
             if(logs[i].command() == 1){
-                on_update_configuration(logs[i]);
+                on_update_configuration_joint(guard, logs[i]);
                 break;
             } else if(logs[i].command() == 2){
-                on_update_configuration_new();
+                on_update_configuration_new(guard);
+            }
+        }
+        // When Configuration entry is committed
+        if(trans_conf){
+            if(trans_conf->state == Configuration::State::OLD_JOINT && trans_conf->index <= commit_index){
+                trans_conf->state == Configuration::State::JOINT;
+                debug_node("Joint consensus committed by Leader.\n");
+            } else if(trans_conf->state == Configuration::State::JOINT_NEW && trans_conf->index2 <= commit_index){
+                on_update_configuration_finish(guard);
             }
         }
 succeed:
@@ -777,12 +804,11 @@ end:
 
     void on_append_entries_response(const raft_messages::AppendEntriesResponse & response, bool heartbeat) {
         // When Leader receive `AppendEntriesResponse` from others
-
-        LOCK 
+        
+        GUARD
 
         // debug_node("Receive response from %s\n", response.name().c_str());
         if (state != NodeState::Leader) {
-            UNLOCK
             return;
         }
 
@@ -794,22 +820,19 @@ end:
             become_follower(response.term());
         } else if (response.term() != current_term) {
             // Reject. Invalid term
-            UNLOCK
             return;
         }
         NodePeer & peer = peers[response.name()];
-        peer.next_index = response.last_log_index() + 1;
-        peer.match_index = response.last_log_index();
-        IndexID new_commit = response.last_log_index();
 
         if (!response.success()) {
             // A failed `AppendEntriesRequest` can certainly not lead to `commit_index` updating
             debug("Peer %s returns AppendEntriesResponse: FAILED\n", response.name().c_str());
-            UNLOCK
             return;
         }
 
         bool call_update_configuration_flag = false;
+        bool committed_joint_flag = false;
+        bool committed_new_flag = false;
         if(!peer.voting_rights){
             if(response.last_log_index() + 1 == logs.size()){
                 // Now this node has catched up with me.
@@ -828,6 +851,24 @@ end:
             }
         }
 
+        if(response.last_log_index() >= logs.size()){
+            // This may possibly happen. ref the Raft Paper Chapter 5.4.2.
+            // At phase(b) when S5 is elected and send heartbeat to S2.
+            // NOTICE that in the Raft Paper, last_log_index and last_log_term are not sent by RPC.
+            peer.next_index = logs.size();
+            peer.match_index = peer.next_index - 1;
+            debug_node("Peer %s's last_log_index %lld >= my log size = %u. My term %llu. Set next_index = %lld, match_index = %lld\n", 
+                    response.name().c_str(), response.last_log_index(), logs.size(), current_term, peer.next_index, peer.match_index);
+            // debug_node("Peer(%s). logs[response.last_log_index()].term() != response.last_log_term(). %lld != %lld. response.last_log_index() = %lld. logs.size = %u\n", 
+            //        response.name().c_str(), logs[response.last_log_index()].term(), response.last_log_term(), response.last_log_index(), logs.size());
+        }else{
+            peer.next_index = response.last_log_index() + 1;
+            peer.match_index = response.last_log_index();
+        }
+        
+        // Until now peer.next_index is valid.
+        IndexID new_commit = response.last_log_index();
+
         // Update commit
         if (commit_index >= response.last_log_index()) {
             // `commit_index` still ahead of peer's index.
@@ -839,7 +880,8 @@ end:
                     response.name().c_str(), response.last_log_index(), commit_index);
             goto CANT_COMMIT;
         }
-        // See `on_append_entries_request`
+
+        // TODO See `on_append_entries_request`
         assert(logs[response.last_log_index()].term() == response.last_log_term());
         if (current_term != logs[response.last_log_index()].term()) {
             // According to <<In Search of an Understandable Consensus Algorithm>>
@@ -857,13 +899,13 @@ end:
 // #if defined(_HIDE_HEARTBEAT_NOTICE)
             // if(!heartbeat) 
 // #endif
-                debug_node("commit_index(%lld) agrees with peer %s. However term disagree(me:%llu, peer:%llu). Peer grants NO commit vote.\n", 
-                        commit_index, response.name().c_str(), current_term, logs[response.last_log_index()].term());
+                debug_node("Peer(%s) grants NO commit vote. commit_index(%lld) agrees. However term disagree(me:%llu, peer:%llu). \n", 
+                        response.name().c_str(), commit_index, current_term, logs[response.last_log_index()].term());
             goto CANT_COMMIT;
         }
         
         // Now we can try to advance `commit_index` to `new_commit = response.last_log_index()`
-        if(trans_conf && trans_conf->is_old_joint() && new_commit >= trans_conf->index){
+        if(trans_conf && trans_conf->state == Configuration::State::OLD_JOINT && new_commit >= trans_conf->index){
             // Require majority of C_{old} and C_{new}
             size_t old_vote = 1;
             size_t new_vote = (trans_conf->is_in_new(name) ? 1 : 0);
@@ -879,14 +921,17 @@ end:
                 }
             }
             if(old_vote > trans_conf->oldvote_thres / 2 && new_vote > trans_conf->newvote_thres / 2){
-			    debug_node("Advance commit_index from %lld to %lld. Joint consensus commited with support new %u(req %u), old %u(req %u)\n", 
+			    debug_node("Advance commit_index from %lld to %lld. Joint consensus committed with support new %u(req %u), old %u(req %u)\n", 
                         commit_index, new_commit, new_vote, trans_conf->newvote_thres, old_vote, trans_conf->oldvote_thres);
                 commit_index = new_commit;
+                trans_conf->state = Configuration::State::JOINT;
+                // Some work must be done when we unlock the mutex at the end of the function. We mark here.
+                committed_joint_flag = true;
             }else{
-			    debug_node("Advance commit_index from %lld to %lld. Joint consensus CAN'T commited with support new %u(req %u), old %u(req %u)\n", 
+			    debug_node("CAN'T advance commit_index from %lld to %lld. Joint consensus CAN'T committed with support new %u(req %u), old %u(req %u)\n", 
                         commit_index, new_commit, new_vote, trans_conf->newvote_thres, old_vote, trans_conf->oldvote_thres);
             }
-        } else if(trans_conf && trans_conf->is_joint_new() && new_commit >= trans_conf->index2){
+        } else if(trans_conf && trans_conf->state == Configuration::State::JOINT_NEW && new_commit >= trans_conf->index2){
             // Require majority of C_{new}
             size_t new_vote = (trans_conf->is_in_new(name) ? 1 : 0);
             for(auto & pp: peers){
@@ -898,11 +943,13 @@ end:
                 }
             }
             if(new_vote > trans_conf->newvote_thres / 2){
-                debug_node("Advance commit_index from %lld to %lld. New configuration commited with support new %u(req %u)\n", 
+                debug_node("Advance commit_index from %lld to %lld. New configuration committed with support new %u(req %u)\n", 
                         commit_index, new_commit, new_vote, trans_conf->newvote_thres);
                 commit_index = new_commit;
+                trans_conf->state = Configuration::State::NEW;
+                committed_new_flag = true;
             }else{
-                debug_node("Advance commit_index from %lld to %lld. New configuration CAN'T commited with support new %u(req %u)\n",
+                debug_node("CAN'T advance commit_index from %lld to %lld. New configuration CAN'T committed with support new %u(req %u)\n",
                         commit_index, new_commit, new_vote, trans_conf->newvote_thres);
             }
         }
@@ -930,20 +977,19 @@ end:
         }
         
 CANT_COMMIT:
-        UNLOCK
         if(call_update_configuration_flag){
             // Requires lock.
-            update_configuration_enable_trans();
+            update_configuration_joint(guard);
         }
         
         if(trans_conf){
             assert(trans_conf);
 
-            if(trans_conf->is_old_joint() && trans_conf->index <= commit_index){
-                update_configuration_new();
+            if(committed_joint_flag){
+                update_configuration_new(guard);
             }
-            if(trans_conf->is_joint_new() && trans_conf->index2 <= commit_index){
-                update_configuration_finish();
+            if(committed_new_flag){
+                update_configuration_finish(guard);
             }
         }
     }
@@ -956,9 +1002,8 @@ CANT_COMMIT:
         }
         return -NUFT_FAIL;
     }
-
-    NuftResult do_log(::raft_messages::LogEntry entry, int command = 0){
-        LOCK
+    
+    NuftResult do_log(std::lock_guard<std::mutex> & guard, ::raft_messages::LogEntry entry, int command = 0){
         if(state != NodeState::Leader){
             // No, I am not the Leader, so please find the Leader first of all.
             debug("Not Leader!!!!!\n");
@@ -968,23 +1013,31 @@ CANT_COMMIT:
         entry.set_term(this->current_term);
         entry.set_index(index);
         entry.set_command(command);
-        
         logs.push_back(entry);
-        UNLOCK
+
         debug("Append LOCAL log Index %lld, Term %llu, commit_index %lld. Now copy to peers.\n", index, current_term, commit_index);
         // "The leader appends the command to its log as a new entry, then issues AppendEntries RPCs in parallel..."
-        do_append_entries(false);
+        do_append_entries(guard, false);
         return NUFT_OK;
     }
-
-    bool do_log(const std::string & log_string){
+    bool do_log(std::lock_guard<std::mutex> & guard, const std::string & log_string){
         ::raft_messages::LogEntry entry;
         entry.set_data(log_string);
-        return this->do_log(entry);
+        return this->do_log(guard, entry);
     }
-
-
+    // For API usage
+    NuftResult do_log(::raft_messages::LogEntry entry, int command = 0){
+        GUARD
+        return do_log(guard, entry, command);
+    }
+    bool do_log(const std::string & log_string){
+        GUARD
+        return do_log(guard, log_string);
+    }
+    
+    // API
     NuftResult update_configuration(const std::vector<std::string> & app, const std::vector<std::string> & rem){
+        GUARD
         if(state != NodeState::Leader || paused){
             return -NUFT_NOT_LEADER;
         }
@@ -993,87 +1046,93 @@ CANT_COMMIT:
             return -NUFT_FAIL;
         }
         trans_conf = new Configuration(app, rem, peers, name);
+        trans_conf->state = Configuration::State::STAGING;
         debug_node("Update configuration with %u add, %u delete.\n", app.size(), rem.size());
         // Must come after we set up Configuration.
         for(auto & s: app){
-            NodePeer & peer = add_peer(s);
+            NodePeer & peer = add_peer(guard, s);
             peer.voting_rights = false;
         }
         if(app.size() > 0){
 			// We don't send log immediately. 
 			// Wait new nodes to catch up with the Leader.
             debug_node("New nodes added, switch to STAGING mode.\n");
-            conf_state = NUFT_CONF_STAGING;
         }else{
-            update_configuration_enable_trans();
+            update_configuration_joint(guard);
         }
         return NUFT_OK;
     }
 
-    void update_configuration_enable_trans(){
+    void update_configuration_joint(std::lock_guard<std::mutex> & guard){
         debug_node("Now all nodes catch up with me, starting switch to joint consensus.\n");
         // Now all nodes catched up and have voting rights.
-        conf_state = NUFT_CONF_TRANS;
         // Send our configuration to peer.
         ::raft_messages::LogEntry entry;
         trans_conf->index = logs.size();
+        trans_conf->state = Configuration::State::OLD_JOINT;
         std::string conf_str = Configuration::to_string(*trans_conf);
         entry.set_data(conf_str);
-        do_log(entry, 1);
+        do_log(guard, entry, 1);
     }
 
-    void on_update_configuration(const raft_messages::LogEntry & entry){
-		// Followers received Leader's configuration request.
+    void on_update_configuration_joint(std::lock_guard<std::mutex> & guard, const raft_messages::LogEntry & entry){
+		// Followers received Leader's entry for joint consensus.
         std::string conf_str = entry.data();
         if(trans_conf){
-            // TODO assert?
-            delete trans_conf;
+            debug_node("Receive Leader's entry for joint consensus, but I'm already in state %d.\n", trans_conf->state);
+            return;
         }
         trans_conf = new Configuration(Configuration::from_string(conf_str));
-        debug_node("Receive Leader's update configuration request to joint consensus. %u add %u delete. Request is %s\n", 
+        trans_conf->state = Configuration::State::OLD_JOINT;
+        debug_node("Receive Leader's entry for joint consensus. %u add %u delete. Request is %s\n", 
                 trans_conf->app.size(), trans_conf->rem.size(), conf_str.c_str());
         for(auto & s: trans_conf->app){
-            NodePeer & peer = add_peer(s);
-            peer.voting_rights = false;
+            NodePeer & peer = add_peer(guard, s);
         }
     }
 
-    void update_configuration_new(){
+    void update_configuration_new(std::lock_guard<std::mutex> & guard){
         // After joint consensus is committed,
         // Leader can now start to switch to C_{new}.
         debug_node("Joint consensus committed.\n");
         assert(trans_conf);
+        trans_conf->state = Configuration::State::JOINT;
         ::raft_messages::LogEntry entry;
         trans_conf->index2 = logs.size();
         entry.set_data("");
-		do_log(entry, 2); 
-        // We must clear the bit lest the function should be triggered repeatedly.
-        trans_conf->index = -1;
+		do_log(guard, entry, 2); 
+        trans_conf->state = Configuration::State::JOINT_NEW;
     }
 
-    void on_update_configuration_new(){
-        debug_node("Receive Leader's update configuration request to new configuration.\n");
-        assert(trans_conf);
+    void on_update_configuration_new(std::lock_guard<std::mutex> & guard){
+        debug_node("Receive Leader's entry for new configuration.\n");
+        if(!trans_conf){
+            debug_node("Receive Leader's entry for new configuration, but I'm not in update conf mode.\n");
+            return;
+        }
+        if(trans_conf->state != Configuration::State::OLD_JOINT){
+            debug_node("Receive Leader's entry for new configuration, but my state = %d.\n", trans_conf->state);
+            return;
+        }
+        trans_conf->state = Configuration::State::JOINT_NEW;
         for(auto p: trans_conf->rem){
             debug_node("Remove peer %s\n", p.c_str());
-            remove_peer(p);
+            remove_peer(guard, p);
         }
-        invoke_callback(NUFT_CB_CONF_END, {this, this->state});
-        delete trans_conf;
-        trans_conf = nullptr;
-        conf_state = NUFT_CONF_BLANK;
-        debug_node("Follower finish updating config.\n");
     }
 
-    void update_configuration_finish(){
+    void update_configuration_finish(std::lock_guard<std::mutex> & guard){
         // If the Leader is not in C_{new},
         // It should yield its Leadership and step down,
         // As soon as C_{new} is committed
-        debug_node("Switch successfully to new consensus. state %d\n", this->state);
-        invoke_callback(NUFT_CB_CONF_END, {this, this->state});
+        debug_node("Switch successfully to new consensus. Node state %d\n", this->state);
         for(auto p: trans_conf->rem){
-            remove_peer(p);
+            debug_node("Remove %s.\n", p.c_str());
+            remove_peer(guard, p);
         }
+        trans_conf->state = Configuration::State::NEW;
+        invoke_callback(NUFT_CB_CONF_END, {this, this->state});
+        // Make sure Leader leaves after new configuration committed.
         if(Nuke::contains(trans_conf->rem, name)){
             debug_node("Leader is not in C_{new}, step down.\n");
             become_follower(current_term);
@@ -1081,8 +1140,23 @@ CANT_COMMIT:
         }
         delete trans_conf;
         trans_conf = nullptr;
-        conf_state = NUFT_CONF_BLANK;
         debug_node("Leader finish updating config.\n");
+    }
+
+    void on_update_configuration_finish(std::lock_guard<std::mutex> & guard){
+        if(!trans_conf){
+            debug_node("Receive Leader's commit for new configuration, but I'm not in update conf mode.\n");
+            return;
+        }
+        if(trans_conf->state != Configuration::State::JOINT_NEW){
+            debug_node("Receive Leader's commit for new configuration, but my state = %d.\n", trans_conf->state);
+            return;
+        }
+        trans_conf->state = Configuration::State::NEW;
+        invoke_callback(NUFT_CB_CONF_END, {this, this->state});
+        delete trans_conf;
+        trans_conf = nullptr;
+        debug_node("Follower finish updating config.\n");
     }
 
     RaftNode(const std::string & addr) : state(NodeState::NotRunning), name(addr) {
@@ -1104,8 +1178,10 @@ CANT_COMMIT:
     RaftNode(const RaftNode &) = delete;
     ~RaftNode() {
         debug("Destruct RaftNode %s.\n", name.c_str());
+        GUARD
         tobe_destructed = true;
         state = NodeState::NotRunning;
+        delete raft_message_server;
         timer_thread.join();
         for (auto & pp : this->peers) {
             NodePeer & peer = pp.second;
@@ -1114,7 +1190,6 @@ CANT_COMMIT:
         if(trans_conf){
             delete trans_conf;
         }
-        delete raft_message_server;
     }
 
     void _list_peers(){
