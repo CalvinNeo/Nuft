@@ -1,3 +1,23 @@
+/*************************************************************************
+*  Nuft -- A C++17 Raft consensus algorithm library
+*  Copyright (C) 2018  Calvin Neo 
+*  Email: calvinneo@calvinneo.com;calvinneo1995@gmail.com
+*  Github: https://github.com/CalvinNeo/Nuft/
+*  
+*  This program is free software: you can redistribute it and/or modify
+*  it under the terms of the GNU General Public License as published by
+*  the Free Software Foundation, either version 3 of the License, or
+*  (at your option) any later version.
+*  
+*  This program is distributed in the hope that it will be useful,
+*  but WITHOUT ANY WARRANTY; without even the implied warranty of
+*  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+*  GNU General Public License for more details.
+*  
+*  You should have received a copy of the GNU General Public License
+*  along with this program.  If not, see <https://www.gnu.org/licenses/>.
+**************************************************************************/
+
 #include "server.h"
 #include "node.h"
 #include <iostream>
@@ -35,6 +55,22 @@ Status RaftMessagesServiceImpl::AppendEntries(ServerContext* context,
     }
 }
 
+Status RaftMessagesServiceImpl::InstallSnapshot(ServerContext* context,
+        const raft_messages::InstallSnapshotRequest* request,
+        raft_messages::InstallSnapshotResponse* response)
+{
+    // When received AppendEntriesRequest
+    #if !defined(_HIDE_HEARTBEAT_NOTICE) && !defined(_HIDE_GRPC_NOTICE)
+    debug("GRPC: Receive InstallSnapshot from Peer %s\n", context->peer().c_str());
+    #endif
+    int response0 = raft_node->on_install_snapshot_request(response, *request);
+    if(response0 == 0){
+        return Status::OK;
+    }else{
+        return Status(grpc::StatusCode::UNAVAILABLE, "Peer is not ready for this request.");
+    }
+}
+
 void RaftMessagesClientAsync::AsyncCompleteRpc()
 {
     void * got_tag;
@@ -59,7 +95,15 @@ void RaftMessagesClientAsync::AsyncCompleteRpc()
                 // TODO Replace true by real value of heartbeat
                 raft_node->on_append_entries_response(call->response, true);
             }
+        }else if (call_base->type == 3) {
+            // This is a response to InstallSnapshot call
+            AsyncClientCall<InstallSnapshotResponse> * call =
+                dynamic_cast<AsyncClientCall<InstallSnapshotResponse> *>(call_base);
+            if(call->status.ok()){
+                raft_node->on_install_snapshot_response(call->response);
+            }
         }
+
         delete call_base;
     }
 }
@@ -143,6 +187,37 @@ void RaftMessagesClientSync::AsyncAppendEntries(const AppendEntriesRequest& requ
 #endif
 }
 
+void RaftMessagesClientSync::AsyncInstallSnapshot(const InstallSnapshotRequest& request)
+{
+    std::string peer_name = this->peer_name;
+    struct RaftNode * raft_node = this->raft_node;
+#if defined(USE_GRPC_SYNC_BARE)
+    std::thread t = std::thread(
+#else
+    task_queue->add_task(
+#endif
+    [this, request, peer_name, raft_node](){
+        InstallSnapshotResponse response;
+        ClientContext context;
+        Status status = this->stub->InstallSnapshot(&context, request, &response);
+        if (status.ok()) {
+            if(Nuke::contains(raft_node->peers, peer_name)){
+                this->raft_node->on_install_snapshot_response(response);
+            }
+        } else {
+            #if !defined(_HIDE_GRPC_NOTICE)
+            if(!heartbeat) debug("GRPC error %d: %s\n", status.error_code(), status.error_message().c_str());
+            #endif
+        }
+    }
+#if defined(USE_GRPC_SYNC_BARE)
+    , request);
+    t.detach();
+#else
+    );
+#endif
+}
+
 
 RaftMessagesClientSync::RaftMessagesClientSync(const char * addr, struct RaftNode * _raft_node) : raft_node(_raft_node), peer_name(addr) {
     std::shared_ptr<Channel> channel = grpc::CreateChannel(addr, grpc::InsecureChannelCredentials());
@@ -168,8 +243,7 @@ RaftServerContext::RaftServerContext(struct RaftNode * node){
     server = std::unique_ptr<Server>{builder->BuildAndStart()};
 }
 RaftServerContext::~RaftServerContext(){
-    debug("Server destructing.\n");
+    server->Shutdown();
     delete service;
     delete builder;
-    debug("Server destructed.\n");
 }

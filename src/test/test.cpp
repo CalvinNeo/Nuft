@@ -113,6 +113,23 @@ void EnableSend(RaftNode * victim, std::vector<int> nds){
     }
 }
 
+template <typename F>
+void WaitAny(RaftNode * ob, int ev, F f){
+    std::mutex mut;
+    std::condition_variable cv;
+
+    ob->callbacks[ev] = [&mut, &cv, &f](int type, NuftCallbackArg * arg) -> int{
+        if(f(type, arg)){
+            std::unique_lock<std::mutex> lk(mut);
+            cv.notify_one();
+        }
+        return 0;
+    };
+    std::unique_lock<std::mutex> lk(mut);
+    cv.wait(lk);
+    ob->callbacks[ev] = nullptr;
+}
+ 
 void WaitElection(RaftNode * ob){
     ob->debugging = 1;
     std::mutex mut;
@@ -133,81 +150,21 @@ void WaitElection(RaftNode * ob){
 }
 
 void WaitElectionStart(RaftNode * ob, std::unordered_set<int> ev){
-    std::mutex mut;
-    std::condition_variable cv;
-
-    ob->callbacks[NUFT_CB_ELECTION_START] = [&mut, &cv, &ev](int type, NuftCallbackArg * arg) -> int{
-        for(auto e: ev){
-            if(arg->a1 == e){
-                goto HIT;
-            }
+    WaitAny(ob, NUFT_CB_ELECTION_START, [&](int type, NuftCallbackArg * arg){
+        if(std::find(ev.begin(), ev.end(), arg->a1) != ev.end()){
+            return 1;
         }
         return 0;
-HIT:
-        std::unique_lock<std::mutex> lk(mut);
-        cv.notify_one();
-        return 0;
-    };
-    std::unique_lock<std::mutex> lk(mut);
-    cv.wait(lk);
-    ob->callbacks[NUFT_CB_ELECTION_START] = nullptr;
+    });
 }
 
-std::tuple<std::mutex*, std::condition_variable*> WaitConfig1(RaftNode * ob, int ev, std::unordered_set<int> st){
-    std::mutex * pmut = new std::mutex();
-    std::condition_variable * pcv = new std::condition_variable();
-    std::mutex & mut = *pmut;
-    std::condition_variable & cv = *pcv;
-
-    ob->callbacks[ev] = [&mut, &cv, &st](int type, NuftCallbackArg * arg) -> int{
-        for(auto s: st){
-            if(arg->node->state == s){
-                goto HIT;
-            }
-        }
-        return 0;
-HIT:
-        std::unique_lock<std::mutex> lk(mut);
-        cv.notify_one();
-        return 0;
-    };
-    return std::make_tuple(pmut, pcv);
-}
-
-void WaitConfig2(RaftNode * ob, int ev, const std::tuple<std::mutex*, std::condition_variable*> & tup){
-    std::mutex * pmut;
-    std::condition_variable * pcv;
-    std::tie(pmut, pcv) = tup;
-    std::mutex & mut = *pmut;
-    std::condition_variable & cv = *pcv;
-
-    std::unique_lock<std::mutex> lk(mut);
-    cv.wait(lk);
-    ob->callbacks[ev] = nullptr;
-    delete pcv;
-    delete pmut;
-}
- 
- 
 void WaitConfig(RaftNode * ob, int ev, std::unordered_set<int> st){
-    std::mutex mut;
-    std::condition_variable cv;
-
-    ob->callbacks[ev] = [&mut, &cv, &st](int type, NuftCallbackArg * arg) -> int{
-        for(auto e: st){
-            if(arg->a1 == e){
-                goto HIT;
-            }
+    WaitAny(ob, ev, [&](int type, NuftCallbackArg * arg){
+        if(std::find(st.begin(), st.end(), arg->a1) != st.end()){
+            return 1;
         }
         return 0;
-HIT:
-        std::unique_lock<std::mutex> lk(mut);
-        cv.notify_one();
-        return 0;
-    };
-    std::unique_lock<std::mutex> lk(mut);
-    cv.wait(lk);
-    ob->callbacks[ev] = nullptr;
+    });
 }
 
 int CheckCommit(IndexID index, const std::string & value){
@@ -318,6 +275,30 @@ void CrashAfterReplicateTo(RaftNode * leader, const std::string & log_str, std::
     DisableNode(leader);
 }
 
+int One(int index, int support){
+    uint64_t now = get_current_ms();
+    while(get_current_ms() < now + 5000){
+        RaftNode * leader = PickNode({RaftNode::NodeState::Leader});
+    }
+}
+
+void print_state(){
+    printf("%15s %12s %5s %9s %7s %7s %6s\n",
+            "Name", "State", "Term", "log size", "commit", "peers", "run");
+    for(auto nd: nodes){
+        printf("%15s %12s %5llu %9u %7lld %7u %6s\n", nd->name.c_str(), 
+                RaftNode::node_state_name(nd->state), nd->current_term, 
+                nd->logs.size(), nd->commit_index, nd->peers.size(),
+				nd->is_running()?"T":"F");
+    }
+}
+
+void print_peers(RaftNode * ob){
+    printf("Node %s's peers are %s\n", ob->name.c_str(), Nuke::join(ob->peers.begin(), ob->peers.end(), ";", [](auto & pr){
+        return pr.second.name;
+    }).c_str());
+}
+
 TEST(Network, RedirectToLeader){
     int n = 5;
     ASSERT_GT(n, 2);
@@ -341,7 +322,7 @@ OK:
 }
 
 TEST(Election, Normal){
-    int n = 5;
+    int n = 10;
     ASSERT_GT(n, 1);
     MakeRaftNodes(n);
     WaitElection(nodes[0]);
@@ -458,7 +439,11 @@ TEST(Commit, FollowerLost){
     // According to strange_failure10.log, Re-election may happen.
     // Because victim2's re-join, however, leader will soon re-gain its leadership.
     WaitElection(victim2);
-    WaitElection(leader);
+    if(leader->state != RaftNode::NodeState::Leader){
+        // leader may already win the election before victim2 timeout.
+        // see followerlost.log
+        WaitElection(leader);
+    }
     // Give time to AppendEntries
     std::this_thread::sleep_for(1s);
     // We use log entry "A" to force a commit_index advancing, otherwise "DOOMED" wont'be committed. 
@@ -559,7 +544,7 @@ TEST(Commit, NetworkPartition){
 }
 
 TEST(Commit, LeaderChange){
-    // Use the demo in the Raft Paper
+    // Use part of the demo in the Raft Paper
     int n = 5;
     ASSERT_GT(n, 2);
     MakeRaftNodes(n);
@@ -573,12 +558,14 @@ TEST(Commit, LeaderChange){
 	nodes[l1]->do_log("1");
     std::this_thread::sleep_for(1s);
     ASSERT_EQ(nodes[l1]->commit_index, 0);
+	print_state();
 
     // S1 replicate successfully only to S2, then crashed.
     printf("GTEST: START Network Partition\n");
     CrashAfterReplicateTo(nodes[l1], "2", {l1+1});
     printf("GTEST: Crash\n");
     // Note leader is crashed.
+	print_state();
     ASSERT_EQ(CheckCommit(0, "1"), 4);
     ASSERT_EQ(CheckCommit(1, "2"), 0);
     ASSERT_EQ(CheckLog(1, "2"), 1);
@@ -605,7 +592,7 @@ TEST(Commit, LeaderChange){
 }
 
 TEST(Config, AddPeer){
-    int n = 3;
+    int n = 4;
     ASSERT_GT(n, 2);
     MakeRaftNodes(n);
     WaitElection(nodes[0]);
@@ -617,8 +604,8 @@ TEST(Config, AddPeer){
     RaftNode * nnd = AddRaftNode(new_port_base);
     leader->update_configuration({nnd->name}, {});
     WaitConfig(leader, NUFT_CB_CONF_END, {RaftNode::NodeState::Leader});
-    ASSERT_EQ(leader->peers.size(), 3);
-    ASSERT_EQ(nnd->peers.size(), 3);
+    ASSERT_EQ(leader->peers.size(), 4);
+    ASSERT_EQ(nnd->peers.size(), 4);
 }
 
 TEST(Config, DelPeer){
@@ -635,6 +622,9 @@ TEST(Config, DelPeer){
     ASSERT_NE(victim, leader);
     leader->update_configuration({}, {victim->name});
     WaitConfig(leader, NUFT_CB_CONF_END, {RaftNode::NodeState::Leader});
+    DisableNode(victim);
+    RaftNode * ob = PickNode({RaftNode::NodeState::Follower});
+    ASSERT_EQ(ob->peers.size(), 1);
     ASSERT_EQ(leader->peers.size(), 1);
 }
 
@@ -656,6 +646,58 @@ TEST(Config, DelLeader){
     WaitElection(ob);
     std::this_thread::sleep_for(1s);
     ASSERT_EQ(CountLeader(), 1);
+}
+
+TEST(Config, AddPeerLeaderLost){
+    int n = 3;
+    ASSERT_GT(n, 2);
+    MakeRaftNodes(n);
+    WaitElection(nodes[0]);
+    using namespace std::chrono_literals;
+    std::this_thread::sleep_for(1s);
+    RaftNode * leader = PickNode({RaftNode::NodeState::Leader});
+    ASSERT_TRUE(leader != nullptr);
+    
+    RaftNode * nnd = AddRaftNode(new_port_base);
+    leader->update_configuration({nnd->name}, {});
+    printf("GTEST: Disable Leader, total size %u\n", nodes.size());
+    print_state();
+    // Disable Leader at staging period.
+    DisableNode(leader);
+    std::this_thread::sleep_for(2s);
+    printf("GTEST: Enable Leader\n");
+    print_state();
+    EnableNode(leader);
+    WaitAny(leader, NUFT_CB_CONF_START, [&](int type, NuftCallbackArg * args){
+            if(args->a1 == RaftNode::Configuration::State::OLD_JOINT){
+                return 1;
+            }
+            return 0;
+        });
+    printf("GTEST: Now begin to replicate joint consensus.\n");
+    print_state();
+    // Give time for leader to re-win a election, and replicate. 
+    // see addpeerleaderlost2.log
+    WaitAny(leader, NUFT_CB_CONF_START, [&](int type, NuftCallbackArg * args){
+            if(args->a1 == RaftNode::Configuration::State::JOINT){
+                // Now joint consensus is committed, but we Disable Leader.
+                DisableNode(leader);
+                return 1;
+            }
+            return 0;
+        });
+    printf("GTEST: Joint consensus committed, disable Leader Again.\n");
+	print_state();
+	WaitElection(nnd);
+	std::this_thread::sleep_for(1s);
+    print_state();
+	RaftNode * leader2 = PickNode({RaftNode::NodeState::Leader});
+	leader2->do_log("Help commit former entries.\n");
+    WaitConfig(nnd, NUFT_CB_CONF_END, {RaftNode::NodeState::Leader, RaftNode::NodeState::Follower});
+    print_state();
+    ASSERT_EQ(nnd->peers.size(), 3);
+    // Though leader disconnected and not committed join consensus, it already has joint consensus entry and will obey it.
+    ASSERT_EQ(leader->peers.size(), 3);
 }
 
 int main(int argc, char ** argv){

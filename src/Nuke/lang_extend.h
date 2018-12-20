@@ -1,4 +1,5 @@
 #include <map>
+#include <vector>
 #include <algorithm>
 
 namespace Nuke{
@@ -11,6 +12,11 @@ template<typename K, typename V>
 bool contains(std::map<K, V> mp, const K & key){
     typename std::map<K, V>::const_iterator iter = mp.find(key);
     return iter != mp.end();
+}
+
+template<typename K>
+bool in(const K & k, std::vector<K> vec){
+    return std::find(vec.begin(), vec.end(), k) != vec.end();
 }
 
 inline void trim(std::string & line) {
