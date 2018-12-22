@@ -63,16 +63,17 @@ $(OBJ_ROOT):
 debug:
 	export GRPC_TRACE=all
 
-.PHONY: clean clc
-clean:
+.PHONY: clean
+clean: clc
 	rm -rf $(BIN_ROOT)
 	rm -f core
-	rm ./test
+	rm -rf ./test
 
 .PHONY: clc
 clc:
 	rm -f *.err
 	rm -f *.out
+	rm -f *.persist
 	
 .PHONY: clean2
 clean2: clean

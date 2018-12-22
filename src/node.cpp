@@ -20,8 +20,37 @@
 
 #include "node.h"
 #include "server.h"
+#include <fstream>
 
 RaftNode * make_raft_node(const std::string & addr) {
     RaftNode * node = new RaftNode(addr);
     return node;
+}
+
+void Persister::Dump(){
+    // TODO maybe use SerializeToString is better.
+    std::fstream fo{(node->name + std::string(".persist")).c_str(), std::ios::binary | std::ios::out};
+    raft_messages::PersistRecord record;
+    record.set_term(node->current_term);
+    record.set_name(node->name);
+    record.set_vote_for(node->vote_for);
+    for(int i = 0; i < node->logs.size(); i++){
+        raft_messages::LogEntry & entry = *(record.add_entries());
+        entry = node->logs[i];
+    }
+    record.SerializeToOstream(&fo);
+    fo.close();
+}
+void Persister::Load(){
+    std::fstream fo{(node->name + std::string(".persist")).c_str(), std::ios::binary | std::ios::in};
+    raft_messages::PersistRecord record;
+    record.ParseFromIstream(&fo);
+    node->current_term = record.term();
+    node->name = record.name();
+    node->vote_for = record.vote_for();
+    node->logs.clear();
+    for(int i = 0; i < record.entries_size(); i++){
+        node->logs.push_back(record.entries(i));
+    }
+    fo.close();
 }

@@ -47,3 +47,4 @@ tags
 *.swo
 *.pyc
 *.err
+*.persist

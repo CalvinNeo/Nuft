@@ -61,12 +61,17 @@ typedef RaftMessagesClientSync RaftMessagesClient;
 #define GRPC_SYNC_CONCUR_LEVEL 5
 #endif
 
+struct Persister{
+    struct RaftNode * node = nullptr;
+    void Dump();
+    void Load();
+};
 
 struct NodePeer {
     NodeName name;
     bool voted_for_me = false;
     // Index of next log to copy
-    IndexID next_index = default_index_cursor;
+    IndexID next_index = default_index_cursor + 1;
     // Index of logs already copied
     IndexID match_index = default_index_cursor;
     // Use `RaftMessagesClient` to send RPC message to peer.
@@ -162,7 +167,7 @@ struct RaftNode {
         Configuration(const std::vector<std::string> & a, const std::vector<std::string> & r, const std::vector<NodeName> & o) : app(a), rem(r), old(o){
             
         }
-		Configuration(const std::vector<std::string> & a, const std::vector<std::string> & r, const std::map<NodeName, NodePeer> & o, const NodeName & leader_exclusive) : app(a), rem(r){
+		Configuration(const std::vector<std::string> & a, const std::vector<std::string> & r, const std::map<NodeName, NodePeer*> & o, const NodeName & leader_exclusive) : app(a), rem(r){
             for(auto && p: o){
                 old.push_back(p.first);
             }
@@ -224,6 +229,7 @@ struct RaftNode {
     std::vector<raft_messages::LogEntry> logs;
     std::string leader_name;
     struct Configuration * trans_conf = nullptr;
+    struct Persister * persister = nullptr; // If set to nulltr then persist is not enabled.
 
     // RSM usage
     IndexID commit_index = default_index_cursor;
@@ -244,7 +250,7 @@ struct RaftNode {
     size_t vote_got = 0;
 
     // Network
-    std::map<NodeName, NodePeer> peers;
+    std::map<NodeName, NodePeer*> peers;
     RaftServerContext * raft_message_server = nullptr;
     std::thread timer_thread;
 
@@ -296,6 +302,7 @@ struct RaftNode {
             return logs[index - base];
         } else{
             // TODO Retrieve from persisted store.
+            debug_node("Access index %lld\n", index);
             assert(false);
         }
     }
@@ -312,7 +319,7 @@ struct RaftNode {
     size_t compute_votes_thres() const {
         size_t voters = 1;
         for(auto & pr: peers){
-            if(pr.second.voting_rights){
+            if(pr.second->voting_rights){
                 voters ++;
             }
         }
@@ -330,12 +337,13 @@ struct RaftNode {
             old_vote = 1;
             new_vote = (trans_conf->is_in_new(name) ? 1 : 0);
             for(auto & pp: peers){
-				assert(pp.second.voting_rights);
-				if (f(pp.second)) {
-                    if(trans_conf->is_in_old(pp.second.name)){
+                NodePeer & peer = *pp.second;
+				assert(peer.voting_rights);
+				if (f(peer)) {
+                    if(trans_conf->is_in_old(peer.name)){
                         old_vote++;
 					}
-                    if(trans_conf->is_in_new(pp.second.name)){
+                    if(trans_conf->is_in_new(peer.name)){
                         new_vote++;
                     }
                 }
@@ -349,9 +357,10 @@ struct RaftNode {
             // Require majority of C_{new}
             new_vote = (trans_conf->is_in_new(name) ? 1 : 0);
             for(auto & pp: peers){
-                assert(pp.second.voting_rights);
-                if (f(pp.second)) {
-                    if(trans_conf->is_in_new(pp.second.name)){
+                NodePeer & peer = *pp.second;
+                assert(peer.voting_rights);
+                if (f(peer)) {
+                    if(trans_conf->is_in_new(peer.name)){
                         new_vote++;
                     }
                 }
@@ -443,31 +452,31 @@ struct RaftNode {
 
     void enable_receive(const std::string & peer_name){
         if(Nuke::contains(peers, peer_name)){
-            peers[peer_name].receive_enabled = true;
+            peers[peer_name]->receive_enabled = true;
         }
     }
     void disable_receive(const std::string & peer_name){
         if(Nuke::contains(peers, peer_name)){
-            peers[peer_name].receive_enabled = false;
+            peers[peer_name]->receive_enabled = false;
         }
     }
     void enable_send(const std::string & peer_name){
         if(Nuke::contains(peers, peer_name)){
-            peers[peer_name].send_enabled = true;
+            peers[peer_name]->send_enabled = true;
         }
     }
     void disable_send(const std::string & peer_name){
         if(Nuke::contains(peers, peer_name)){
-            peers[peer_name].send_enabled = false;
+            peers[peer_name]->send_enabled = false;
         }
     }
     bool is_peer_receive_enabled(const std::string & peer_name) const{
         if(!Nuke::contains(peers, peer_name)) return false;
-        return peers[peer_name].receive_enabled;
+        return peers[peer_name]->receive_enabled;
     }
     bool is_peer_send_enabled(const std::string & peer_name) const{
         if(!Nuke::contains(peers, peer_name)) return false;
-        return peers[peer_name].send_enabled;
+        return peers[peer_name]->send_enabled;
     }
 
     void reset_election_timeout() {
@@ -483,19 +492,19 @@ struct RaftNode {
         election_fail_timeout_due = UINT64_MAX;
     }
 
-    NodePeer & add_peer(std::lock_guard<std::mutex> & guard, const std::string & peer_name) {
+    NodePeer * add_peer(std::lock_guard<std::mutex> & guard, const std::string & peer_name) {
         //TODO Bad idea to return this reference, use `unique_ptr` later
         assert(peer_name != "");
         assert(peer_name != name);
         if (Nuke::contains(peers, peer_name)) {
             debug_node("Peer %s already found. Now size %u\n", peer_name.c_str(), peers.size());
         } else {
-            peers[peer_name] = NodePeer{peer_name};
-            peers[peer_name].send_enabled = true;
-            peers[peer_name].receive_enabled = true;
-            peers[peer_name].raft_message_client = new RaftMessagesClient(peer_name, this);
+            peers[peer_name] = new NodePeer{peer_name};
+            peers[peer_name]->send_enabled = true;
+            peers[peer_name]->receive_enabled = true;
+            peers[peer_name]->raft_message_client = new RaftMessagesClient(peer_name, this);
 #if defined(USE_GRPC_SYNC) && !defined(USE_GRPC_SYNC_BARE)
-            peers[peer_name].raft_message_client->task_queue = sync_client_task_queue;
+            peers[peer_name]->raft_message_client->task_queue = sync_client_task_queue;
 #endif
         }
         return peers[peer_name];
@@ -504,14 +513,17 @@ struct RaftNode {
         // Must under the protection of mutex
         if(Nuke::contains(peers, peer_name)){
             debug_node("Remove %s from cluster.\n", peer_name.c_str());
-            peers[peer_name].send_enabled = false;
-            peers[peer_name].receive_enabled = false;
-            delete peers[peer_name].raft_message_client;
-            peers[peer_name].raft_message_client = nullptr;
+            peers[peer_name]->send_enabled = false;
+            peers[peer_name]->receive_enabled = false;
+            delete peers[peer_name]->raft_message_client;
+            peers[peer_name]->raft_message_client = nullptr;
+
+            delete peers[peer_name];
+            peers[peer_name] = nullptr;
             peers.erase(peer_name);
         }
     }
-    NodePeer & add_peer(const std::string & peer_name) {
+    NodePeer * add_peer(const std::string & peer_name) {
         GUARD
         return add_peer(guard, peer_name);
     }
@@ -521,7 +533,8 @@ struct RaftNode {
     }
 
     void do_apply() {
-
+        invoke_callback(NUFT_CB_ON_APPLY, {this});
+        // TODO advance last_applied
     }
 
     void switch_to(NodeState new_state) {
@@ -552,24 +565,25 @@ struct RaftNode {
 
     void become_leader() {
         switch_to(NodeState::Leader);
-        // We should not reset vote_for.
-//        vote_for = vote_for_none;
+        // IMPORTANT: We should not reset vote_for.
+        // Error: vote_for = vote_for_none;
         leader_name = name;
         debug_node("Now I am the Leader of term %llu, because I got %llu votes.\n", current_term, vote_got);
         for (auto & pp : this->peers) {
             // Actually we don't know how many logs have been copied,
             // So we assume no log are copied to peer.
-            pp.second.match_index = default_index_cursor;
+            NodePeer & peer = *pp.second;
+            peer.match_index = default_index_cursor;
             // "When a leader first comes to power,
             // it initializes all nextIndex values to the index just after the
             // last one in its log."
 #define USE_COMMIT_INDEX
 #if !defined(USE_COMMIT_INDEX)
-            pp.second.next_index = last_log_index() + 1;
-            assert(pp.second.next_index >= 0);
+            peer.next_index = last_log_index() + 1;
+            assert(peer.next_index >= 0);
 #else
             // This strategy is from Mushroom's implementation.
-            pp.second.next_index = commit_index + 1;
+            peer.next_index = commit_index + 1;
 #endif
         }
 
@@ -595,6 +609,7 @@ struct RaftNode {
         current_term++;
         vote_got = 1; // Vote for myself
         vote_for = name;
+        if(persister) persister->Dump();
 
         uint64_t current_ms = get_current_ms();
         election_fail_timeout_due = current_ms + default_election_fail_timeout_interval;
@@ -604,15 +619,15 @@ struct RaftNode {
         elect_timeout_due = UINT64_MAX;
 
         for (auto & pp : peers) {
-            if(!pp.second.send_enabled) continue;
+            if(!pp.second->send_enabled) continue;
             raft_messages::RequestVoteRequest request;
             request.set_name(name);
             request.set_term(current_term);
             request.set_last_log_index(last_log_index());
             request.set_last_log_term(last_log_term());
             
-            NodePeer & peer = pp.second;
-            pp.second.voted_for_me = false;
+            NodePeer & peer = *pp.second;
+            peer.voted_for_me = false;
             debug_node("Send RequestVoteRequest from %s to %s\n", name.c_str(), peer.name.c_str());
             assert(peer.raft_message_client != nullptr);
             peer.raft_message_client->AsyncRequestVote(request);
@@ -678,6 +693,7 @@ end:
         response.set_term(current_term);
         invoke_callback(NUFT_CB_ELECTION_START, {this, ELE_VOTE, response.vote_granted()});
         debug_node("Respond from %s to %s with %s\n", name.c_str(), request.name().c_str(), response.vote_granted() ? "YES" : "NO");
+        if(persister) persister->Dump();
         return 0;
     }
 
@@ -695,7 +711,7 @@ end:
             return;
         }
         // `operator[]` will create automaticlly
-        NodePeer & peer = peers[response.name()];
+        NodePeer & peer = *(peers[response.name()]);
 
         if(peer.voting_rights){
             debug_node("Receive vote from %s = %s\n", response.name().c_str(), response.vote_granted() ? "YES" : "NO");
@@ -704,6 +720,7 @@ end:
                 // However, we don't know who's the leader yet, and the Leader may not exist now,
                 // because this may be new election.
                 become_follower(response.term());
+                if(persister) persister->Dump();
                 invoke_callback(NUFT_CB_ELECTION_END, {this, ELE_FAIL});
             }else{
                 if (trans_conf){
@@ -739,8 +756,8 @@ CANT_BECOME_LEADER:
         // When heartbeat is set to true, this function will NOT send logs, even if there are some updates.
         // If you believe the logs are updated and need to be notified to peers, then you must set `heartbeat` to false.
         for (auto & pp : this->peers) {
-            if(!pp.second.send_enabled) continue;
-            NodePeer & peer = pp.second;
+            NodePeer & peer = *pp.second;
+            if(!peer.send_enabled) continue;
             // We copy log entries to peer, from `prev_log_index`.
             // This may fail when "an existing entry conflicts with a new one (same index but different terms)"
             IndexID prev_log_index = peer.next_index - 1;
@@ -759,7 +776,7 @@ CANT_BECOME_LEADER:
             // and fail to update their log when we firstly sent entries in `do_log`.
             if(peer.next_index < last_log_index() + 1){
                 if(heartbeat){}else
-                debug_node("Copy to peer %s LogEntries[%lld, %lld)\n", peer.name.c_str(), peer.next_index, last_log_index());
+                debug_node("Copy to peer %s LogEntries[%lld, %lld]\n", peer.name.c_str(), peer.next_index, last_log_index());
             }
             // TODO Handle when logs is compacted
             assert(peer.next_index >= get_base_index());
@@ -833,6 +850,7 @@ CANT_BECOME_LEADER:
         }
 
 
+        response.set_term(current_term);
         // `request.prev_log_index() == -1` happens at the very beginning when a Leader with no Log, and send heartbeats to others.
         if (request.prev_log_index() >= 0 && request.prev_log_index() > last_log_index()) {
             // I don't have the `prev_log_index()` entry.
@@ -844,52 +862,47 @@ CANT_BECOME_LEADER:
             // Can erase them only we conflicts happen.
             // debug_node("My last_log_index = %u > request.prev_log_index() = %lld. Maybe still probing, maybe condition 5.4.2(b)\n", last_log_index(), request.prev_log_index());
         }
-        if (request.prev_log_index() >= 0 && gl(request.prev_log_index()).term() != request.prev_log_term()) {
-            // "If an existing entry conflicts with a new one (same index but different terms),
-            // delete the existing entry and all that follow it"
-            debug_node("AppendEntries fail. My term at prev_log_index %lld is %llu. Conflict with Leader's prev_log_term= %llu. leader_commit = %lld. Do erase from Leader's prev_log_index to end.\n", 
-                request.prev_log_index(), gl(request.prev_log_index()).term(), request.prev_log_term(), request.leader_commit());
-            // assert(commit_index < request.prev_log_index());
-            assert(request.prev_log_index() >= get_base_index());
-            logs.erase(logs.begin() + request.prev_log_index() - get_base_index(), logs.end());
-            debug_node("Now last_log_index() = %lld, last_log_term() == %llu\n", last_log_index(), last_log_term());
-            goto end;
-        }
+        // "If an existing entry conflicts with a new one (same index but different terms),
+        // delete the existing entry and all that follow it"
+        // TODO IMPORTANT When I convert this into MIT 6.824 tests, It will fail TestFigure8Unreliable2C
 
-        // TODO Handle log compaction
-        prev_i++; // prev_i point to where I want to copy the log.
-        for (; prev_i < logs.size() && prev_j < request.entries_size(); prev_i++, prev_j++) {
-            // Remove all entries not meet with `request.entries()` after `prev_i`
-            assert(prev_i >= get_base_index());
-            if (gl(prev_i).term() != request.entries(prev_j).term()) {
-                assert(commit_index < prev_i);
-                debug_node("Remove all conflict entries [%lld, ), logs.size() = %llu, base = %lld.\n", prev_i, logs.size(), get_base_index());
-                logs.erase(logs.begin() + prev_i - get_base_index(), logs.end());
-                break;
+        if(request.prev_log_index() == default_index_cursor){
+            goto NEXT;
+        }
+        TermID wrong_term = gl(request.prev_log_index()).term();
+        if(request.prev_log_term() != wrong_term){
+            for(IndexID i = request.prev_log_index() - 1; i >= default_index_cursor; i--){
+                if(i == default_index_cursor){
+                    debug_node("Revoke last_log_index to %lld\n", default_index_cursor);
+                    response.set_last_log_index(default_index_cursor);
+                    response.set_last_log_term(default_term_cursor);
+                } else if(gl(i).term() != wrong_term){
+                    debug_node("Revoke last_log_index to %lld\n", i);
+                    response.set_last_log_index(i);
+                    response.set_last_log_term(gl(i).term());
+                }
+                goto end2;
             }
         }
-        if(request.entries_size()){
-            debug_node("Leader %s wants to AppendEntries [%lld, %lld).\n", request.name().c_str(), last_log_index() + 1, logs.size() + request.entries_size() - prev_j);
+NEXT:
+        if(request.prev_log_index() + 1 <= last_log_index()){
+            debug_node("Erase [%lld, ), last_log_index %lld\n", request.prev_log_index() + 1, last_log_index());
+            logs.erase(logs.begin() + request.prev_log_index() + 1 - get_base_index(), logs.end());
         }
-        if (prev_j < request.entries_size()) {
-            // Copy the rest entries
-            logs.insert(logs.end(), request.entries().begin() + prev_j, request.entries().end());
-        }else{
-            if(request.entries_size()){
-                debug_node("No more entries to be added from Leader.\n");
-            }
-        }
+        logs.insert(logs.end(), request.entries().begin(), request.entries().end());
 
         if (request.leader_commit() > commit_index) {
             // Update commit
-            // Seems we can't make this assertion here
+            // Seems we can't make this assertion here,
+            // according to Figure2 Receiver Implementation 5.
+            // see https://thesquareplanet.com/blog/students-guide-to-raft/
             // assert(request.leader_commit() <= last_log_index());
             commit_index = std::min(request.leader_commit(), last_log_index());
             debug_node("Leader %s ask me to advance commit_index to %lld.\n", request.name().c_str(), commit_index);
         }else{
             if(request.entries_size()){
-                debug_node("Node %s commit_index remain %lld, because it's greater than %lld, entries_size = %u. last_log_index = %lld\n", 
-                        name.c_str(), commit_index, request.leader_commit(), request.entries_size(), last_log_index());
+                debug_node("My commit_index remain %lld, because it's greater than Leader's commit %lld, entries_size = %u. last_log_index = %lld\n", 
+                        commit_index, request.leader_commit(), request.entries_size(), last_log_index());
             }
         }
 
@@ -912,13 +925,14 @@ CANT_BECOME_LEADER:
             }
         }
 succeed:
-        // debug("AppendEntries Succeed.\n");
         response.set_success(true);
 end:
         // Must set term here, because `become_follower` may change it
         response.set_term(current_term);
         response.set_last_log_index(last_log_index());
         response.set_last_log_term(last_log_term());
+end2:
+        if(persister) persister->Dump();
         return 0;
     }
 
@@ -939,11 +953,12 @@ end:
             // ref `on_vote_response`.
             debug_node("Become Follower because find newer term %llu from Peer %s.\n", response.term(), response.name().c_str());
             become_follower(response.term());
+            if(persister) persister->Dump();
         } else if (response.term() != current_term) {
             // Reject. Invalid term
             return;
         }
-        NodePeer & peer = peers[response.name()];
+        NodePeer & peer = *(peers[response.name()]);
 
         if (!response.success()) {
             // A failed `AppendEntriesRequest` can certainly not lead to `commit_index` updating
@@ -963,14 +978,11 @@ end:
                 debug_node("Node %s has now catched up with me, grant right for vote.\n", response.name().c_str());
                 peer.voting_rights = true;
             }
-            bool has_no_right = false;
-            for(auto pr2: peers){
-                if(!pr2.second.voting_rights){
-                    has_no_right = true;
-                    break;
-                }
-            }
-            if(!has_no_right){
+            // If there are no staging nodes, staging finished.
+            if(std::find_if(peers.begin(), peers.end(), [](auto & pp){
+                NodePeer & peer2 = *pp.second;
+                return peer2.voting_rights == false;
+            }) == peers.end()){
                 finish_staging_flag = true;
             }
         }
@@ -1070,7 +1082,8 @@ end:
 NORMAL_TEST_COMMIT:
             size_t commit_vote = 1; // This one is from myself.
             for (auto & pp : peers) {
-                if (pp.second.voting_rights && pp.second.match_index >= new_commit) {
+                NodePeer & peer2 = *pp.second;
+                if (peer2.voting_rights && peer2.match_index >= new_commit) {
                     commit_vote++;
                 }
             }
@@ -1128,6 +1141,7 @@ CANT_COMMIT:
         entry.set_index(index);
         entry.set_command(command);
         logs.push_back(entry);
+        if(persister) persister->Dump();
 
         debug("Append LOCAL log Index %lld, Term %llu, commit_index %lld. Now copy to peers.\n", index, current_term, commit_index);
         // "The leader appends the command to its log as a new entry, then issues AppendEntries RPCs in parallel..."
@@ -1165,7 +1179,7 @@ CANT_COMMIT:
         // Must come after we set up Configuration.
         for(auto & s: app){
             if(s != name){
-                NodePeer & peer = add_peer(guard, s);
+                NodePeer & peer = *add_peer(guard, s);
                 peer.voting_rights = false;
             }
         }
@@ -1206,7 +1220,7 @@ CANT_COMMIT:
                 trans_conf->app.size(), trans_conf->rem.size(), conf_str.c_str());
         for(auto & s: trans_conf->app){
             if(s != name){
-                NodePeer & peer = add_peer(guard, s);
+                NodePeer & peer = *add_peer(guard, s);
             }
         }
     }
@@ -1288,6 +1302,7 @@ CANT_COMMIT:
 
     RaftNode(const std::string & addr) : state(NodeState::NotRunning), name(addr) {
         std::memset(callbacks, 0, sizeof callbacks);
+        persister = new Persister{this};
         using namespace std::chrono_literals;
 #if defined(USE_GRPC_SYNC) && !defined(USE_GRPC_SYNC_BARE)
         sync_client_task_queue = std::make_shared<Nuke::ThreadExecutor>(GRPC_SYNC_CONCUR_LEVEL);
@@ -1312,8 +1327,7 @@ CANT_COMMIT:
         debug_node("Wait join\n");
         timer_thread.join();
         for (auto & pp : this->peers) {
-            NodePeer & peer = pp.second;
-            delete (peer.raft_message_client);
+            remove_peer(guard, pp.first);
         }
         if(trans_conf){
             delete trans_conf;
