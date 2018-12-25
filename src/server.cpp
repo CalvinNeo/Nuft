@@ -29,6 +29,9 @@ Status RaftMessagesServiceImpl::RequestVote(ServerContext* context,
     #if !defined(_HIDE_GRPC_NOTICE)
     debug("GRPC: Receive RequestVoteRequest from Peer %s Name %s\n", context->peer().c_str(), request->name().c_str());
     #endif
+    if(!raft_node){
+        return Status::OK;
+    }
     int response0 = raft_node->on_vote_request(response, *request);
     if(response0 == 0){
         return Status::OK;
@@ -47,6 +50,9 @@ Status RaftMessagesServiceImpl::AppendEntries(ServerContext* context,
     #if !defined(_HIDE_HEARTBEAT_NOTICE) && !defined(_HIDE_GRPC_NOTICE)
     debug("GRPC: Receive AppendEntriesRequest from Peer %s\n", context->peer().c_str());
     #endif
+    if(!raft_node){
+        return Status::OK;
+    }
     int response0 = raft_node->on_append_entries_request(response, *request);
     if(response0 == 0){
         return Status::OK;
@@ -127,25 +133,32 @@ void RaftMessagesClientSync::AsyncRequestVote(const RequestVoteRequest& request)
     // A copy of `request` is needed
     // TODO Replace `std::thread` implementation with future.then implementation. 
     std::string peer_name = this->peer_name;
-    struct RaftNode * raft_node = this->raft_node;
+    auto strongThis = shared_from_this();
 #if defined(USE_GRPC_SYNC_BARE)
     std::thread t = std::thread(
 #else
-    task_queue->add_task(
+    task_queue->add_task("V" + request.name() + peer_name,
 #endif
-    [this, request, peer_name, raft_node](){ 
+    [strongThis, request, peer_name](){ 
         RequestVoteResponse response;
         ClientContext context;
-        Status status = this->stub->RequestVote(&context, request, &response);
+        Status status = strongThis->stub->RequestVote(&context, request, &response);
         if (status.ok()) {
+            if(!strongThis->raft_node){
+                debug("Response RaftNode destructed.\n");
+                return;
+            }
             // Test whether raft_node_>peers[peer_name] is destructed.
-            if(Nuke::contains(raft_node->peers, peer_name)){
-                this->raft_node->on_vote_response(response);
+            if(Nuke::contains(strongThis->raft_node->peers, peer_name)){
+                if(request.time() < strongThis->raft_node->start_timepoint){
+                    debug("Response from previous request REJECTED.\n");
+                }else
+                    strongThis->raft_node->on_vote_response(response);
             }
         } else {
-            #if !defined(_HIDE_GRPC_NOTICE)
-            debug("GRPC error %d: %s\n", status.error_code(), status.error_message().c_str());
-            #endif
+            // #if !defined(_HIDE_GRPC_NOTICE)
+            debug("GRPC error(RequestVote %s->%s) %d: %s\n", request.name().c_str(), peer_name.c_str(), status.error_code(), status.error_message().c_str());
+            // #endif
         }
     }
 #if defined(USE_GRPC_SYNC_BARE)
@@ -159,24 +172,31 @@ void RaftMessagesClientSync::AsyncRequestVote(const RequestVoteRequest& request)
 void RaftMessagesClientSync::AsyncAppendEntries(const AppendEntriesRequest& request, bool heartbeat)
 {
     std::string peer_name = this->peer_name;
-    struct RaftNode * raft_node = this->raft_node;
+    auto strongThis = shared_from_this();
 #if defined(USE_GRPC_SYNC_BARE)
     std::thread t = std::thread(
 #else
-    task_queue->add_task(
+    task_queue->add_task("A" + request.name() + peer_name,
 #endif
-    [this, heartbeat, request, peer_name, raft_node](){
+    [strongThis, heartbeat, request, peer_name](){
         AppendEntriesResponse response;
         ClientContext context;
-        Status status = this->stub->AppendEntries(&context, request, &response);
+        Status status = strongThis->stub->AppendEntries(&context, request, &response);
         if (status.ok()) {
-            if(Nuke::contains(raft_node->peers, peer_name)){
-                this->raft_node->on_append_entries_response(response, heartbeat);
+            if(!strongThis->raft_node){
+                debug("Response RaftNode destructed.\n");
+                return;
+            }
+            if(Nuke::contains(strongThis->raft_node->peers, peer_name)){
+                if(request.time() < strongThis->raft_node->start_timepoint){
+                    debug("Response from previous request REJECTED.\n");
+                }else
+                    strongThis->raft_node->on_append_entries_response(response, heartbeat);
             }
         } else {
-            #if !defined(_HIDE_GRPC_NOTICE)
-            if(!heartbeat) debug("GRPC error %d: %s\n", status.error_code(), status.error_message().c_str());
-            #endif
+            // #if !defined(_HIDE_GRPC_NOTICE)
+            if(!heartbeat) debug("GRPC error(RequestVote %s->%s) %d: %s\n", request.name().c_str(), peer_name.c_str(), status.error_code(), status.error_message().c_str());
+            // #endif
         }
     }
 #if defined(USE_GRPC_SYNC_BARE)
@@ -241,9 +261,11 @@ RaftServerContext::RaftServerContext(struct RaftNode * node){
     builder->AddListeningPort(node->name, grpc::InsecureServerCredentials());
     builder->RegisterService(service);
     server = std::unique_ptr<Server>{builder->BuildAndStart()};
+    wait_thread = std::thread([&](){server->Wait();});
 }
 RaftServerContext::~RaftServerContext(){
     server->Shutdown();
+    wait_thread.join();
     delete service;
     delete builder;
 }

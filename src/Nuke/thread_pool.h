@@ -4,11 +4,14 @@
 #include <vector>
 #include <functional>
 #include <atomic>
+#include <map>
+#include <string>
 
 namespace Nuke{
 struct ThreadExecutor{
     // `ThreadExecutor` works as a Task Queue
     typedef std::function<void()> Task;
+    typedef std::pair<std::string, std::function<void()>> CapTask;
     size_t capacity;
 
     bool check_empty_unguard(){
@@ -21,16 +24,19 @@ struct ThreadExecutor{
             while(close_flag.load()){
                 std::unique_lock<std::mutex> lk(mut);
                 while(check_empty_unguard()){
+                    // Wait until there is work to do.
                     cv_empty.wait(lk);
                     if(!close_flag.load()){
                         lk.unlock();
                         return;
                     }
                 }
-                Task t = tasks.back();
+                CapTask t = tasks.back();
                 tasks.pop_back();
                 lk.unlock();
-                t();
+                // printf("Run %s\n", t.first.c_str());
+                t.second();
+                // printf("Finish %s\n", t.first.c_str());
             }
         };
         ths = new std::thread[capacity](inner_loop);
@@ -43,7 +49,12 @@ struct ThreadExecutor{
 
     void add_task(Task && t){
         std::unique_lock<std::mutex> lk(mut);
-        tasks.push_back(t);
+        tasks.push_back(std::make_pair(std::string(""), t));
+        cv_empty.notify_one();
+    }
+    void add_task(const std::string & name, Task && t){
+        std::unique_lock<std::mutex> lk(mut);
+        tasks.push_back(std::make_pair(name, t));
         cv_empty.notify_one();
     }
 
@@ -69,7 +80,7 @@ struct ThreadExecutor{
         }
     }
     std::thread * ths;
-    std::vector<Task> tasks;
+    std::vector<CapTask> tasks;
     std::mutex mut;
     std::condition_variable cv_empty;
     std::atomic<bool> close_flag;

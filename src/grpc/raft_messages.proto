@@ -20,6 +20,7 @@ message AppendEntriesRequest {
 	required uint64 prev_log_term = 4;
 	required int64 leader_commit = 5;
 	repeated LogEntry entries = 6;
+    required uint64 time = 7;
 }
 
 message AppendEntriesResponse {
@@ -28,6 +29,7 @@ message AppendEntriesResponse {
 	required bool success = 3;
 	required int64 last_log_index = 4;
 	required uint64 last_log_term = 5;
+    required uint64 time = 6;
 }
 
 message RequestVoteRequest {
@@ -35,12 +37,14 @@ message RequestVoteRequest {
 	required uint64 term = 2;
 	required int64 last_log_index = 3;
 	required uint64 last_log_term = 4;
+    required uint64 time = 5;
 }
 
 message RequestVoteResponse {
 	required string name = 1;
 	required uint64 term = 2;
 	required bool vote_granted = 3;
+    required uint64 time = 4;
 }
 
 message InstallSnapshotRequest {
@@ -49,11 +53,20 @@ message InstallSnapshotRequest {
     required int64 last_included_index = 3;
     required int64 last_included_term = 4;
     required bytes data = 6;
+    required uint64 time = 7;
 }
 
 message InstallSnapshotResponse{
     required uint64 term = 1;
     required string name = 2;
+    required uint64 time = 3;
+}
+
+message ConfRecord{
+    required string peers = 1;
+    required int64 index = 2;
+    required int64 index2 = 3;
+    required int64 state = 4;
 }
 
 message PersistRecord{
@@ -61,6 +74,7 @@ message PersistRecord{
     required string name = 2;
     required string vote_for = 3;
     repeated LogEntry entries = 4;
+    optional ConfRecord conf_record = 5;
 }
 
 service RaftMessages {

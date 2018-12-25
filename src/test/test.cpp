@@ -14,12 +14,21 @@ uint16_t port_base = 7100;
 std::vector<RaftNode *> nodes;
 
 void FreeRaftNodes(){
+    // We move Leaders to the last of vector `nodes`, so we delete them at the end.
+    // Before Leaders die, they will send their last AppendEntries RPC, which,
+    // if handled without care, will interfere tests in the future.
+    std::sort(nodes.begin(), nodes.end(), [](auto a, auto b){
+        return a->state < b->state;
+    });
     printf("=== Clearing %d\n", nodes.size());
+    using namespace std::chrono_literals;
     for(auto nd: nodes){
         printf("=== Deleting %s\n", nd->name.c_str());
         delete nd;
+        nd = nullptr;
     }
     nodes.clear();
+    std::this_thread::sleep_for(1s);
 }
 
 void MakeRaftNodes(int n){
@@ -89,9 +98,14 @@ int PickIndex(std::unordered_set<int> nt, int order = 0){
     return -1;
 }
 
-void DisableNode(RaftNode * victim){
-    victim->stop();
+void DisableNode(RaftNode * victim, bool unguarded = false){
+    if(unguarded){
+        victim->stop_unguarded();
+    }else{
+        victim->stop();
+    }
     for(auto nd: nodes){
+        // Now all other nodes can't receive RPC from victim.
         // We don't disable send because we want to observe.
         nd->disable_receive(victim->name);
     }
@@ -112,14 +126,28 @@ void EnableSend(RaftNode * victim, std::vector<int> nds){
         victim->enable_send(nodes[nd%nodes.size()]->name);
     }
 }
+void DisableReceive(RaftNode * victim, std::vector<int> nds){
+    for(auto nd: nds){
+        victim->disable_receive(nodes[nd%nodes.size()]->name);
+    }
+}
+void EnableReceive(RaftNode * victim, std::vector<int> nds){
+    for(auto nd: nds){
+        victim->enable_receive(nodes[nd%nodes.size()]->name);
+    }
+}
 void CrashNode(RaftNode * victim){
     DisableNode(victim);
     victim->logs.clear();
-    victim->current_term = 7777777;
-    victim->vote_for = "LLLLLLLLL";
+    victim->current_term = 77777;
+    victim->vote_for = "LLLLL";
+    victim->name = victim->name;
+    victim->reset_peers();
+    if(victim->trans_conf) delete victim->trans_conf;
+    victim->trans_conf = nullptr;
 }
 void RecoverNode(RaftNode * victim){
-    victim->persister->Load();
+    victim->start(victim->name);
     EnableNode(victim);
 }
 
@@ -287,13 +315,13 @@ int One(int index, int support){
 }
 
 void print_state(){
-    printf("%15s %12s %5s %9s %7s %7s %6s\n",
-            "Name", "State", "Term", "log size", "commit", "peers", "run");
+    printf("%15s %12s %5s %9s %7s %7s %6s %6s\n",
+            "Name", "State", "Term", "log size", "commit", "peers", "run", "trans");
     for(auto nd: nodes){
-        printf("%15s %12s %5llu %9u %7lld %7u %6s\n", nd->name.c_str(), 
+        printf("%15s %12s %5llu %9u %7lld %7u %6s %6d\n", nd->name.c_str(), 
                 RaftNode::node_state_name(nd->state), nd->current_term, 
                 nd->logs.size(), nd->commit_index, nd->peers.size(),
-				nd->is_running()?"T":"F");
+				nd->is_running()?"T":"F", (!nd->trans_conf)?0:nd->trans_conf->state);
     }
 }
 
@@ -402,6 +430,7 @@ TEST(Commit, FollowerLost){
     int n = 3;
     ASSERT_GT(n, 2);
     MakeRaftNodes(n);
+    print_state();
     WaitElection(nodes[0]);
     using namespace std::chrono_literals;
     std::this_thread::sleep_for(1s);
@@ -413,6 +442,7 @@ TEST(Commit, FollowerLost){
     ASSERT_NE(victim, nullptr);
     printf("GTEST: Disable 1\n");
     DisableNode(victim);
+    print_state();
 
 	int ln = 4;
     for(int i = 0; i < ln; i++){
@@ -420,28 +450,30 @@ TEST(Commit, FollowerLost){
         leader->do_log(logstr);
         std::this_thread::sleep_for(1s);
         int support = CheckCommit(i, logstr);
-        printf("GTEST: support %d\n", support);
+        printf("GTEST[%d]: support %d, content %s\n", i, support, logstr.c_str());
         // Shutting one node will not affect.
         ASSERT_GE(support, MajorityCount(n));
     }
 
     // Disable 2 nodes
 	RaftNode * victim2 = PickNode({RaftNode::NodeState::Follower, RaftNode::NodeState::Candidate});
-    printf("GTEST: Disable 2\n");
-	DisableNode(victim2);
+    printf("GTEST: now mute victim2 %s.\n", victim2->name.c_str());
+	DisableReceive(victim2, {0, 1, 2});
+	DisableSend(victim2, {0, 1, 2});
+    // victim2 will keep electing but never succeed. 
+    print_state();
 	leader->do_log("DOOMED"); // Index = 4
-    std::this_thread::sleep_for(1s);
+    std::this_thread::sleep_for(2s);
     // A majority of nodes disconnected, this entry should not be committed.
 	ASSERT_EQ(CheckCommit(ln, "DOOMED"), 0);
 	ASSERT_EQ(leader->commit_index, ln - 1);
     
-    // Make sure victim2 will start new election, as part of the test
-    // The waiting time can't be either too long or too short(victim2's not timeout).
-    std::this_thread::sleep_for(1s);
     // Enable victim2
-    EnableNode(victim2);
-    // According to strange_failure10.log, Re-election may happen.
-    // Because victim2's re-join, however, leader will soon re-gain its leadership.
+    printf("GTEST: now enable victim2.\n");
+	EnableReceive(victim2, {0, 1, 2});
+	EnableSend(victim2, {0, 1, 2});
+    print_state();
+    // Leader lost leadership because of victim2's reconnection, however, leader will soon re-gain its leadership.
     WaitElection(victim2);
     if(leader->state != RaftNode::NodeState::Leader){
         // leader may already win the election before victim2 timeout.
@@ -454,7 +486,7 @@ TEST(Commit, FollowerLost){
     // ref `on_append_entries_response`
     leader->do_log("A");
     std::this_thread::sleep_for(1s);
-    printf("GTEST now check entries.\n");
+    printf("GTEST: now check entries.\n");
     // Now, this entry should be committed, because victim2 re-connected.
     ASSERT_GE(CheckCommit(ln + 1, "A"), MajorityCount(n));
     ASSERT_EQ(leader->commit_index, ln + 1);
@@ -465,6 +497,7 @@ TEST(Commit, LeaderLost){
     int n = 3;
     ASSERT_GT(n, 2);
     MakeRaftNodes(n);
+    print_state();
     WaitElection(nodes[0]);
     using namespace std::chrono_literals;
     std::this_thread::sleep_for(1s);
@@ -507,6 +540,7 @@ TEST(Commit, NetworkPartition){
     int n = 5;
     ASSERT_GT(n, 2);
     MakeRaftNodes(n);
+    print_state();
     WaitElection(nodes[0]);
     using namespace std::chrono_literals;
     std::this_thread::sleep_for(1s);
@@ -532,6 +566,7 @@ TEST(Commit, NetworkPartition){
     WaitElection(nodes[(l1+2)%n]);
     std::this_thread::sleep_for(1s);
     ASSERT_EQ(CountLeader(), 2);
+    // There are 2 Leaders in both parts.
     int l2 = PickIndex({RaftNode::NodeState::Leader}, 1);
     if(l2 == l1){
         l2 = PickIndex({RaftNode::NodeState::Leader}, 0);
@@ -543,8 +578,12 @@ TEST(Commit, NetworkPartition){
     
     RecoverNetworkPartition(p1, p2);
     std::this_thread::sleep_for(2s);
+    printf("GTEST: Now l1 %d should be Follower, l2 %d should be Leader.\n", l1, l2);
+    // Now l2 is the leader
+    print_state();
     ASSERT_EQ(CheckCommit(1, "3"), 5);
     ASSERT_EQ(nodes[l1]->commit_index, 1);
+    FreeRaftNodes();
 }
 
 TEST(Commit, LeaderChange){
@@ -552,6 +591,7 @@ TEST(Commit, LeaderChange){
     int n = 5;
     ASSERT_GT(n, 2);
     MakeRaftNodes(n);
+    print_state();
     WaitElection(nodes[0]);
     using namespace std::chrono_literals;
     std::this_thread::sleep_for(1s);
@@ -595,12 +635,14 @@ TEST(Commit, LeaderChange){
 //    std::this_thread::sleep_for(1s);
 //    ASSERT_EQ(CheckCommit(1, "3"), 0);
     // (c)
+    FreeRaftNodes();
 }
 
 TEST(Config, AddPeer){
     int n = 4;
     ASSERT_GT(n, 2);
     MakeRaftNodes(n);
+    print_state();
     WaitElection(nodes[0]);
     using namespace std::chrono_literals;
     std::this_thread::sleep_for(1s);
@@ -612,12 +654,14 @@ TEST(Config, AddPeer){
     WaitConfig(leader, NUFT_CB_CONF_END, {RaftNode::NodeState::Leader});
     ASSERT_EQ(leader->peers.size(), n);
     ASSERT_EQ(nnd->peers.size(), n);
+    FreeRaftNodes();
 }
 
 TEST(Config, DelPeer){
     int n = 3;
     ASSERT_GT(n, 2);
     MakeRaftNodes(n);
+    print_state();
     WaitElection(nodes[0]);
     using namespace std::chrono_literals;
     std::this_thread::sleep_for(1s);
@@ -632,12 +676,14 @@ TEST(Config, DelPeer){
     RaftNode * ob = PickNode({RaftNode::NodeState::Follower});
     ASSERT_EQ(ob->peers.size(), 1);
     ASSERT_EQ(leader->peers.size(), 1);
+    FreeRaftNodes();
 }
 
 TEST(Config, DelLeader){
     int n = 3;
     ASSERT_GT(n, 2);
     MakeRaftNodes(n);
+    print_state();
     WaitElection(nodes[0]);
     using namespace std::chrono_literals;
     std::this_thread::sleep_for(1s);
@@ -652,12 +698,15 @@ TEST(Config, DelLeader){
     WaitElection(ob);
     std::this_thread::sleep_for(1s);
     ASSERT_EQ(CountLeader(), 1);
+    print_state();
+    FreeRaftNodes();
 }
 
 TEST(Config, AddPeerLeaderLost){
     int n = 3;
     ASSERT_GT(n, 2);
     MakeRaftNodes(n);
+    print_state();
     WaitElection(nodes[0]);
     using namespace std::chrono_literals;
     std::this_thread::sleep_for(1s);
@@ -666,33 +715,23 @@ TEST(Config, AddPeerLeaderLost){
     
     RaftNode * nnd = AddRaftNode(new_port_base);
     leader->update_configuration({nnd->name}, {});
-    printf("GTEST: Disable Leader, total size %u\n", nodes.size());
-    print_state();
-    // Disable Leader at staging period.
-    DisableNode(leader);
-    std::this_thread::sleep_for(2s);
-    printf("GTEST: Enable Leader\n");
-    print_state();
-    EnableNode(leader);
-    WaitAny(leader, NUFT_CB_CONF_START, [&](int type, NuftCallbackArg * args){
-            if(args->a1 == RaftNode::Configuration::State::OLD_JOINT){
-                return 1;
-            }
-            return 0;
-        });
     printf("GTEST: Now begin to replicate joint consensus.\n");
     print_state();
     // Give time for leader to re-win a election, and replicate. 
     // see addpeerleaderlost2.log
     WaitAny(leader, NUFT_CB_CONF_START, [&](int type, NuftCallbackArg * args){
-            if(args->a1 == RaftNode::Configuration::State::JOINT){
+    //        if(args->a1 == RaftNode::Configuration::State::JOINT){
+    // TODO If we crash at JOINT, then no Leader will issue entry for new configuration.
+            if(args->a1 == RaftNode::Configuration::State::JOINT_NEW){
                 // Now joint consensus is committed, but we Disable Leader.
-                DisableNode(leader);
+                printf("GTEST: Joint consensus committed, disable Leader Again.\n");
+                // NOTICE the lambda holds the lock of raft node.
+                print_state();
+                DisableNode(leader, true);
                 return 1;
             }
             return 0;
         });
-    printf("GTEST: Joint consensus committed, disable Leader Again.\n");
 	print_state();
 	WaitElection(nnd);
 	std::this_thread::sleep_for(1s);
@@ -704,12 +743,14 @@ TEST(Config, AddPeerLeaderLost){
     ASSERT_EQ(nnd->peers.size(), n);
     // Though leader disconnected and not committed join consensus, it already has joint consensus entry and will obey it.
     ASSERT_EQ(leader->peers.size(), n);
+    FreeRaftNodes();
 }
 
-TEST(Persist, CrashAndRestartAll){
+TEST(Persist, CrashAll){
     int n = 3;
     ASSERT_GT(n, 2);
     MakeRaftNodes(n);
+    print_state();
     WaitElection(nodes[0]);
     using namespace std::chrono_literals;
     std::this_thread::sleep_for(1s);
@@ -726,10 +767,13 @@ TEST(Persist, CrashAndRestartAll){
         // Shutting one node will not affect.
         ASSERT_GE(support, MajorityCount(n));
     }
-    for(int iter = 0; iter < 3; iter++){
+    for(int iter = 0; iter < 1; iter++){
+        print_state();
+        printf("GTEST: Now crash\n");
         for(auto nd: nodes){
             CrashNode(nd);
         }
+        print_state();
         printf("GTEST: Now restart\n");
         for(auto nd: nodes){
             RecoverNode(nd);
@@ -739,9 +783,10 @@ TEST(Persist, CrashAndRestartAll){
     leader->do_log("COMMIT");
     std::this_thread::sleep_for(1s);
     ASSERT_EQ(CheckCommit(ln, "COMMIT"), n);
+    FreeRaftNodes();
 }
 
-TEST(Persist, CrashNode){
+TEST(Persist, CrashLeader){
     int n = 5;
     ASSERT_GT(n, 2);
     MakeRaftNodes(n);
@@ -755,6 +800,41 @@ TEST(Persist, CrashNode){
     for(int i = 0; i < ln; i++){
         
     }
+    FreeRaftNodes();
+}
+
+TEST(Persist, AddPeer){
+    int n = 4;
+    ASSERT_GT(n, 2);
+    MakeRaftNodes(n);
+    WaitElection(nodes[0]);
+    using namespace std::chrono_literals;
+    std::this_thread::sleep_for(1s);
+    RaftNode * leader = PickNode({RaftNode::NodeState::Leader});
+    ASSERT_TRUE(leader != nullptr);
+    
+    RaftNode * nnd = AddRaftNode(new_port_base);
+    leader->update_configuration({nnd->name}, {});
+    WaitAny(leader, NUFT_CB_CONF_START, [&](int type, NuftCallbackArg * args){
+            if(args->a1 == RaftNode::Configuration::State::JOINT_NEW){
+                // Now joint consensus is committed
+                return 1;
+            }
+            return 0;
+        });
+    print_state();
+    printf("GTEST: Joint consensus committed, crash Leader.\n");
+    CrashNode(leader);
+    // Election Timeout
+    std::this_thread::sleep_for(2s);
+    printf("GTEST: Recover Leader.\n");
+    RecoverNode(leader);
+    print_state();
+    // We wait for several seconds and everything should be OK.
+    std::this_thread::sleep_for(1s);
+    ASSERT_EQ(leader->peers.size(), n);
+    ASSERT_EQ(nnd->peers.size(), n);
+    FreeRaftNodes();
 }
 
 int main(int argc, char ** argv){

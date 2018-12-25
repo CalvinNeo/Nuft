@@ -55,6 +55,9 @@ struct RaftMessagesServiceImpl : public raft_messages::RaftMessages::Service {
     RaftMessagesServiceImpl(struct RaftNode * _raft_node) : raft_node(_raft_node) {
 
     }
+    ~RaftMessagesServiceImpl(){
+        raft_node = nullptr;
+    }
 
     Status RequestVote(ServerContext* context, const raft_messages::RequestVoteRequest* request,
                        raft_messages::RequestVoteResponse* response) override;
@@ -67,7 +70,7 @@ struct RaftMessagesServiceImpl : public raft_messages::RaftMessages::Service {
 };
 
 
-struct RaftMessagesClientSync {
+struct RaftMessagesClientSync : std::enable_shared_from_this<RaftMessagesClientSync>{
     // `RaftMessagesClientSync` defines how to make a sync RPC call, and how to handle its results.
     using RequestVoteResponse = ::raft_messages::RequestVoteResponse;
     using RequestVoteRequest = ::raft_messages::RequestVoteRequest;
@@ -78,7 +81,8 @@ struct RaftMessagesClientSync {
 
     // Back reference to raft node.
     struct RaftNode * raft_node = nullptr;
-    std::shared_ptr<Nuke::ThreadExecutor> task_queue;
+    // std::shared_ptr<Nuke::ThreadExecutor> task_queue;
+    Nuke::ThreadExecutor * task_queue = nullptr;
     std::string peer_name;
 
     void AsyncRequestVote(const RequestVoteRequest& request);
@@ -88,7 +92,7 @@ struct RaftMessagesClientSync {
     RaftMessagesClientSync(const char * addr, struct RaftNode * _raft_node);
     RaftMessagesClientSync(const std::string & addr, struct RaftNode * _raft_node);
     ~RaftMessagesClientSync() {
-
+        raft_node = nullptr;
     }
 private:
     std::unique_ptr<raft_messages::RaftMessages::Stub> stub;
@@ -165,5 +169,6 @@ struct RaftServerContext{
     std::unique_ptr<Server> server;
     ServerBuilder * builder;
     RaftServerContext(struct RaftNode * node);
+    std::thread wait_thread;
     ~RaftServerContext();
 };

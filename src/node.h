@@ -63,7 +63,7 @@ typedef RaftMessagesClientSync RaftMessagesClient;
 
 struct Persister{
     struct RaftNode * node = nullptr;
-    void Dump();
+    void Dump(bool backup_conf = false);
     void Load();
 };
 
@@ -75,7 +75,7 @@ struct NodePeer {
     // Index of logs already copied
     IndexID match_index = default_index_cursor;
     // Use `RaftMessagesClient` to send RPC message to peer.
-    RaftMessagesClient * raft_message_client = nullptr;
+    std::shared_ptr<RaftMessagesClient> raft_message_client;
     // Debug usage
     bool receive_enabled = true;
     bool send_enabled = true;
@@ -197,6 +197,8 @@ struct RaftNode {
         size_t newvote_thres = 0;
         enum State{
             // This state means `trans_conf == nullptr`.
+            // No cluster membership changes.
+            // This state is used when we initialize a node, especially from a persist storage.
             BLANK,
             // In staging period, no entries are logged.
             STAGING,
@@ -248,16 +250,20 @@ struct RaftNode {
 
     // Candidate exclusive
     size_t vote_got = 0;
+    size_t new_vote = 0;
+    size_t old_vote = 0;
 
     // Network
     std::map<NodeName, NodePeer*> peers;
     RaftServerContext * raft_message_server = nullptr;
     std::thread timer_thread;
+    uint64_t start_timepoint; // Reject RPC from previous test cases.
 
     // RPC utils for sync
 #if defined(USE_GRPC_SYNC) && !defined(USE_GRPC_SYNC_BARE)
     // All peer's RaftMessagesClient share one `sync_client_task_queue`.
-    std::shared_ptr<Nuke::ThreadExecutor> sync_client_task_queue;
+    // std::shared_ptr<Nuke::ThreadExecutor> sync_client_task_queue;
+    Nuke::ThreadExecutor * sync_client_task_queue = nullptr;
 #endif
 
     // Utils
@@ -267,6 +273,15 @@ struct RaftNode {
     // API
     NuftCallbackFunc callbacks[NUFT_CB_SIZE];
     bool debugging = false;
+
+    void print_state(){
+        printf("%15s %12s %5s %9s %7s %7s %6s %6s\n",
+                "Name", "State", "Term", "log size", "commit", "peers", "run", "trans");
+        printf("%15s %12s %5llu %9u %7lld %7u %6s %6d\n", name.c_str(),
+                RaftNode::node_state_name(state), current_term,
+                logs.size(), commit_index, peers.size(),
+                is_running()?"T":"F", (!trans_conf)?0:trans_conf->state);
+    }
 
     NuftResult invoke_callback(NUFT_CB_TYPE type, NuftCallbackArg arg){
         if(callbacks[type] != nullptr){
@@ -297,6 +312,7 @@ struct RaftNode {
     }
 
     ::raft_messages::LogEntry & gl(IndexID index){
+        // Find logs[i].index() == logs[i].index()
         IndexID base = get_base_index();
         if(index - base >= 0){
             return logs[index - base];
@@ -327,11 +343,12 @@ struct RaftNode {
     }
     
     template <typename F>
-    int enough_votes_trans_conf(F f, size_t & new_vote, size_t & old_vote){
+    int enough_votes_trans_conf(F f){
         // Once a given server adds the new configuration entry to its log,
         // it uses that configuration for all future decisions (a server
         // always uses the latest configuration in its log, regardless
         // of whether the entry is committed). 
+        old_vote = 0; new_vote = 0;
         if(trans_conf && Nuke::in(trans_conf->state, {Configuration::State::OLD_JOINT, Configuration::State::JOINT})){
             // Require majority of C_{old} and C_{new}
             old_vote = 1;
@@ -340,6 +357,7 @@ struct RaftNode {
                 NodePeer & peer = *pp.second;
 				assert(peer.voting_rights);
 				if (f(peer)) {
+                    // If got votes from peer
                     if(trans_conf->is_in_old(peer.name)){
                         old_vote++;
 					}
@@ -383,7 +401,33 @@ struct RaftNode {
         // There's no Leader.
         return leader_name;
     }
-
+    bool test_election(){
+        if (trans_conf){
+            int ans = enough_votes_trans_conf([&](const NodePeer & peer){return peer.voted_for_me;});
+            if(ans > 0) {
+                goto VOTE_ENOUGH;
+            }else if(ans < 0) {
+                goto VOTE_NOT_ENOUGH;
+            }else{
+                goto NORMAL_TEST_VOTE;
+            }
+        } 
+NORMAL_TEST_VOTE:
+        vote_got = 1;
+        for(auto & pp: peers){
+            const NodePeer & peer = *(pp.second);
+            if(peer.voted_for_me){
+                vote_got ++;
+            }
+        }
+        if (!enough_votes(vote_got)) {
+            goto VOTE_NOT_ENOUGH;
+        }
+VOTE_ENOUGH:
+        return true;
+VOTE_NOT_ENOUGH:
+        return false;
+    }
     void on_timer() {
         // Check heartbeat
         uint64_t current_ms = get_current_ms();
@@ -415,12 +459,12 @@ struct RaftNode {
                 ) {
             // In this case, no consensus is reached during the previous election,
             // We restart a new election.
-            if (enough_votes(vote_got)) {
+            if (test_election()) {
                 // Maybe there is only me in the cluster...
                 become_leader();
                 invoke_callback(NUFT_CB_ELECTION_END, {this, ELE_SUC});
             } else {
-                debug("Election failed(timeout) with %u votes at term %lu.\n", vote_got, current_term);
+                debug_node("Election failed(timeout) with %u votes at term %lu.\n", vote_got, current_term);
                 GUARD
                 reset_election_timeout();
                 invoke_callback(NUFT_CB_ELECTION_END, {this, ELE_T});
@@ -433,21 +477,56 @@ struct RaftNode {
         if (state != NodeState::NotRunning) {
             return;
         }
+        paused = false;
         raft_message_server = new RaftServerContext(this);
         state = NodeState::Follower;
+        persister->Dump(true);
         reset_election_timeout();
     }
+    void start(const std::string & new_name){
+        name = new_name;
+        persister->Load();
+        start();
+    }
+    void apply_conf(std::lock_guard<std::mutex> & guard, const Configuration & conf){
+        debug_node("Apply conf: old %u, app %u, rem %u\n", conf.old.size(), conf.app.size(), conf.rem.size());
+        for(int i = 0; i < conf.old.size(); i++){
+            if(conf.old[i] != name && !(conf.state >= Configuration::State::JOINT_NEW && Nuke::contains(conf.rem, conf.old[i]))){
+                add_peer(guard, conf.old[i]);
+            } else{
+                debug_node("Apply % fail. conf.state %d\n", conf.old[i].c_str(), conf.state);
+            }
+        }
+        for(int i = 0; i < conf.app.size(); i++){
+            if(conf.app[i] != name && (conf.state >= Configuration::State::OLD_JOINT)){
+                add_peer(guard, conf.app[i]);
+            }
+        }
+        debug_node("Apply conf end.\n");
+    }
+    void apply_conf(const Configuration & conf){
+        GUARD
+        apply_conf(guard, conf);
+    }
 
-    void stop() {
-        debug_node("Stop node of %s\n", name.c_str());
+    void stop_unguarded() {
         paused = true;
+        debug_node("Stop node of %s\n", name.c_str());
+    }
+    void stop() {
+        GUARD
+        stop(guard);
+    }
+    void stop(std::lock_guard<std::mutex> & guard) {
+        stop_unguarded();
     }
     void resume() {
         paused = false;
         debug_node("Resume node of %s\n", name.c_str());
     }
     bool is_running() const{
-        return (state != NodeState::NotRunning) && (!paused);
+        return (state != NodeState::NotRunning) && (!paused) 
+            && (!tobe_destructed); // Prevent Ghost RPC called by `RaftMessagesServiceImpl::RequestVote` etc
     }
 
     void enable_receive(const std::string & peer_name){
@@ -499,10 +578,11 @@ struct RaftNode {
         if (Nuke::contains(peers, peer_name)) {
             debug_node("Peer %s already found. Now size %u\n", peer_name.c_str(), peers.size());
         } else {
+            debug_node("Add Peer %s. Now size %u\n", peer_name.c_str(), peers.size());
             peers[peer_name] = new NodePeer{peer_name};
             peers[peer_name]->send_enabled = true;
             peers[peer_name]->receive_enabled = true;
-            peers[peer_name]->raft_message_client = new RaftMessagesClient(peer_name, this);
+            peers[peer_name]->raft_message_client = std::make_shared<RaftMessagesClient>(peer_name, this);
 #if defined(USE_GRPC_SYNC) && !defined(USE_GRPC_SYNC_BARE)
             peers[peer_name]->raft_message_client->task_queue = sync_client_task_queue;
 #endif
@@ -515,8 +595,9 @@ struct RaftNode {
             debug_node("Remove %s from cluster.\n", peer_name.c_str());
             peers[peer_name]->send_enabled = false;
             peers[peer_name]->receive_enabled = false;
-            delete peers[peer_name]->raft_message_client;
-            peers[peer_name]->raft_message_client = nullptr;
+            // delete peers[peer_name]->raft_message_client;
+            // peers[peer_name]->raft_message_client = nullptr;
+            peers[peer_name]->raft_message_client->raft_node = nullptr;
 
             delete peers[peer_name];
             peers[peer_name] = nullptr;
@@ -530,6 +611,15 @@ struct RaftNode {
     void remove_peer(const std::string & peer_name){
         GUARD
         return remove_peer(guard, peer_name);
+    }
+    void reset_peers(std::lock_guard<std::mutex> & guard){
+        for (auto & pp : this->peers) {
+            remove_peer(guard, pp.first);
+        }
+    }
+    void reset_peers(){
+        GUARD
+        reset_peers(guard);
     }
 
     void do_apply() {
@@ -568,7 +658,12 @@ struct RaftNode {
         // IMPORTANT: We should not reset vote_for.
         // Error: vote_for = vote_for_none;
         leader_name = name;
-        debug_node("Now I am the Leader of term %llu, because I got %llu votes.\n", current_term, vote_got);
+        if(trans_conf){
+            debug_node("Now I am the Leader of term %llu, because I got vote new %u thres %u old %u thres %u.\n", 
+                current_term, new_vote, trans_conf->newvote_thres, old_vote, trans_conf->oldvote_thres);
+        }else{
+            debug_node("Now I am the Leader of term %llu, because I got %llu votes.\n", current_term, vote_got);
+        }
         for (auto & pp : this->peers) {
             // Actually we don't know how many logs have been copied,
             // So we assume no log are copied to peer.
@@ -592,7 +687,20 @@ struct RaftNode {
         last_tick = 0;
     }
 
-    void do_install_snapshot(){
+    NuftResult do_install_snapshot(IndexID last_included_index, const std::string & state_machine_state){
+        GUARD
+        if(last_log_index() <= get_base_index()){
+            debug_node("Already snapshotted.\n");
+            return NUFT_FAIL;
+        }
+        if(last_log_index() > last_log_index()){
+            debug_node("Error index.\n");
+            return NUFT_FAIL;
+        }
+        if(last_log_index() > last_applied){
+            debug_node("We can only snapshot until last_applied.\n");
+            return NUFT_FAIL;
+        }
     }
 
     int on_install_snapshot_request(raft_messages::InstallSnapshotResponse* response_ptr, const raft_messages::InstallSnapshotRequest& request) {
@@ -607,7 +715,8 @@ struct RaftNode {
         
         switch_to(NodeState::Candidate);
         current_term++;
-        vote_got = 1; // Vote for myself
+        // NOTICE Now compute `vote_for` in `test_election` by counting `vote_for_me`
+        // vote_got = 1; // Vote for myself
         vote_for = name;
         if(persister) persister->Dump();
 
@@ -625,11 +734,12 @@ struct RaftNode {
             request.set_term(current_term);
             request.set_last_log_index(last_log_index());
             request.set_last_log_term(last_log_term());
+            request.set_time(get_current_ms());
             
             NodePeer & peer = *pp.second;
             peer.voted_for_me = false;
             debug_node("Send RequestVoteRequest from %s to %s\n", name.c_str(), peer.name.c_str());
-            assert(peer.raft_message_client != nullptr);
+            // assert(peer.raft_message_client != nullptr);
             peer.raft_message_client->AsyncRequestVote(request);
         }
     }
@@ -640,9 +750,12 @@ struct RaftNode {
         std::string peer_name = request.name();
         if((!is_running()) || (!is_peer_receive_enabled(peer_name))){
         #if !defined(_HIDE_PAUSED_NODE_NOTICE)
-            debug_node("Ignore RequestVoteRequest from %s, because (%s/%s) is not running.\n", request.name().c_str(), 
-                    is_running()?"":"I", is_peer_receive_enabled(peer_name)?"":peer_name.c_str());
+            debug_node("Ignore RequestVoteRequest from %s, I state %d paused %d, Peer running %d.\n", request.name().c_str(), 
+                    state, paused, is_peer_receive_enabled(peer_name));
         #endif
+            return -1;
+        }
+        if((uint64_t)request.time() < (uint64_t)start_timepoint){
             return -1;
         }
         GUARD
@@ -691,6 +804,7 @@ struct RaftNode {
 end:
         // Must set term here, cause `become_follower` may change it
         response.set_term(current_term);
+        response.set_time(get_current_ms());
         invoke_callback(NUFT_CB_ELECTION_START, {this, ELE_VOTE, response.vote_granted()});
         debug_node("Respond from %s to %s with %s\n", name.c_str(), request.name().c_str(), response.vote_granted() ? "YES" : "NO");
         if(persister) persister->Dump();
@@ -701,6 +815,9 @@ end:
         // Called from server.h
         // When a candidate receives vote from others
 
+        if((uint64_t)response.time() < (uint64_t)start_timepoint){
+            return;
+        }
         GUARD
         if (state != NodeState::Candidate) {
             return;
@@ -723,28 +840,16 @@ end:
                 if(persister) persister->Dump();
                 invoke_callback(NUFT_CB_ELECTION_END, {this, ELE_FAIL});
             }else{
-                if (trans_conf){
-                    size_t new_vote; size_t old_vote;
-                    int ans = enough_votes_trans_conf([&](const NodePeer & peer){return (!peer.voted_for_me) && response.vote_granted();}, new_vote, old_vote);
-                    if(ans > 0) goto BECOME_LEADER;
-                    else if(ans < 0) goto CANT_BECOME_LEADER;
-                    else goto NORMAL_TEST_VOTE;
-                } 
-NORMAL_TEST_VOTE:
                 if ((!peer.voted_for_me) && response.vote_granted()) {
                     // If peer grant vote for me for the FIRST time.
                     peer.voted_for_me = true;
-                    vote_got ++;
+                    // vote_got ++;
                 }
-                if (!enough_votes(vote_got)) {
-                    goto CANT_BECOME_LEADER;
+                if(test_election()){
+                    assert(response.term() <= current_term);
+                    become_leader();
+                    invoke_callback(NUFT_CB_ELECTION_END, {this, ELE_SUC});
                 }
-BECOME_LEADER:
-                assert(response.term() <= current_term);
-                become_leader();
-                invoke_callback(NUFT_CB_ELECTION_END, {this, ELE_SUC});
-CANT_BECOME_LEADER:
-                (void) 0;
             }
         }else{
             debug_node("Receive vote from %s, who has NO right for voting.\n", response.name().c_str());
@@ -770,6 +875,7 @@ CANT_BECOME_LEADER:
             request.set_prev_log_index(prev_log_index);
             request.set_prev_log_term(prev_log_term);
             request.set_leader_commit(commit_index);
+            request.set_time(get_current_ms());
             // Add entries to request
             // NOTICE Even this is a heartbeat RPC, we still need to check entries.
             // Because some nodes may suffer from network failure etc., 
@@ -802,10 +908,12 @@ CANT_BECOME_LEADER:
             #if defined(_HIDE_HEARTBEAT_NOTICE)
             if(request.entries().size() == 0){}else
             #endif
-            debug_node("Ignore AppendEntriesRequest from %s by %s, because {%s/%s} is not running.\n", 
-                    request.name().c_str(), name.c_str(), paused?"I":"", 
-                    is_peer_receive_enabled(peer_name)?"peer":"");
+            debug_node("Ignore AppendEntriesRequest from %s, I state %d paused %d, Peer running %d.\n", request.name().c_str(), 
+                    state, paused, is_peer_receive_enabled(peer_name));
             #endif
+            return -1;
+        }
+        if((uint64_t)request.time() < (uint64_t)start_timepoint){
             return -1;
         }
         GUARD
@@ -826,7 +934,9 @@ CANT_BECOME_LEADER:
 
         if (request.term() > current_term) {
             // Discover a request with newer term.
-            debug_node("Become Follower: Receive AppendEntriesRequest from %s with newer term %llu, me %llu.\n", request.name().c_str(), request.term(), current_term);
+            print_state();
+            debug_node("Become Follower: Receive AppendEntriesRequest from %s with newer term %llu, me %llu, my time %llu, peer time %llu.\n", 
+                request.name().c_str(), request.term(), current_term, (uint64_t)start_timepoint % 10000, (uint64_t)request.time() % 10000);
             become_follower(request.term());
             leader_name = request.name();
             // Observe the emergence of a new Leader.
@@ -836,8 +946,14 @@ CANT_BECOME_LEADER:
             // In this case, this node is a Follower, maybe through `RequestVoteRequest`.
             // Now new leader is elected and not knowing the elected leader.
             // This function is mostly for debugging/API, in order to trigger callback, otherwise the debugging thread may block forever at `cv.wait()`
-            // TODO Whether the Follower will increase term when receiving RequestVote from a Candidate?
-            become_follower(request.term());
+            // IMPORTANT: We can't call `become_follower` here because it will reset vote_for.
+            // Consider the following situation(total 3 nodes):
+            // 1. A ask for B's vote, B granted, A become leader.
+            // 2. A don't have enough time to send AppendEntriesRequest
+            // 3. C timeout without acknowledging A's leadership
+            // 4. C ask for A's vote
+            // 5. If we call become_follower, B will forgot it has already voted for A
+            // Error: become_follower(request.term());
             leader_name = request.name();
             invoke_callback(NUFT_CB_ELECTION_END, {this, ELE_SUC_OB});
         }
@@ -854,7 +970,7 @@ CANT_BECOME_LEADER:
         // `request.prev_log_index() == -1` happens at the very beginning when a Leader with no Log, and send heartbeats to others.
         if (request.prev_log_index() >= 0 && request.prev_log_index() > last_log_index()) {
             // I don't have the `prev_log_index()` entry.
-            debug_node("AppendEntries fail. I don't have prev_log_index = %llu, my last_log_index = %llu.\n", request.prev_log_index(), last_log_index());
+            debug_node("AppendEntries fail. I don't have prev_log_index = %lld, my last_log_index = %lld.\n", request.prev_log_index(), last_log_index());
             goto end;
         }
         if(request.prev_log_index() >= 0 && request.prev_log_index() < last_log_index()){
@@ -867,17 +983,18 @@ CANT_BECOME_LEADER:
         // TODO IMPORTANT When I convert this into MIT 6.824 tests, It will fail TestFigure8Unreliable2C
 
         if(request.prev_log_index() == default_index_cursor){
+            // If Leader has no entry, then we definately not match.
             goto NEXT;
         }
         TermID wrong_term = gl(request.prev_log_index()).term();
         if(request.prev_log_term() != wrong_term){
             for(IndexID i = request.prev_log_index() - 1; i >= default_index_cursor; i--){
                 if(i == default_index_cursor){
-                    debug_node("Revoke last_log_index to %lld\n", default_index_cursor);
+                    debug_node("Revoke last_log_index to %lld, only from here our logs agree.\n", default_index_cursor);
                     response.set_last_log_index(default_index_cursor);
                     response.set_last_log_term(default_term_cursor);
                 } else if(gl(i).term() != wrong_term){
-                    debug_node("Revoke last_log_index to %lld\n", i);
+                    debug_node("Revoke last_log_index to %lld, remove all wrong entries of term %llu.\n", i, wrong_term);
                     response.set_last_log_index(i);
                     response.set_last_log_term(gl(i).term());
                 }
@@ -919,6 +1036,7 @@ NEXT:
         if(trans_conf){
             if(trans_conf->state == Configuration::State::OLD_JOINT && trans_conf->index <= commit_index){
                 trans_conf->state == Configuration::State::JOINT;
+                persister->Dump();
                 debug_node("Advance index to %lld > trans_conf->index %lld, Joint consensus committed.\n", commit_index, trans_conf->index);
             } else if(trans_conf->state == Configuration::State::JOINT_NEW && trans_conf->index2 <= commit_index){
                 on_update_configuration_finish(guard);
@@ -931,6 +1049,7 @@ end:
         response.set_term(current_term);
         response.set_last_log_index(last_log_index());
         response.set_last_log_term(last_log_term());
+        response.set_time(get_current_ms());
 end2:
         if(persister) persister->Dump();
         return 0;
@@ -941,6 +1060,9 @@ end2:
         
         GUARD
 
+        if((uint64_t)response.time() < (uint64_t)start_timepoint){
+            return;
+        }
         // debug_node("Receive response from %s\n", response.name().c_str());
         if (state != NodeState::Leader) {
             return;
@@ -1040,10 +1162,9 @@ end2:
         
         // Now we can try to advance `commit_index` to `new_commit = response.last_log_index()` by voting.
         if(trans_conf){
-            size_t new_vote, old_vote;
             int ans = enough_votes_trans_conf([&](const NodePeer & peer){
                 return peer.match_index >= new_commit;
-            }, new_vote, old_vote);
+            });
             if(ans > 0){
                 if(trans_conf && trans_conf->state == Configuration::State::JOINT_NEW && new_commit >= trans_conf->index2){
                     debug_node("Advance commit_index from %lld to %lld. New configuration committed with support new %u(req %u)\n", 
@@ -1110,10 +1231,8 @@ CANT_COMMIT:
         }
         
         if(trans_conf){
-            assert(trans_conf);
-
             if(committed_joint_flag){
-                update_configuration_new(guard);
+                on_update_configuration_joint_committed(guard);
             }
             if(committed_new_flag){
                 update_configuration_finish(guard);
@@ -1133,8 +1252,12 @@ CANT_COMMIT:
     NuftResult do_log(std::lock_guard<std::mutex> & guard, ::raft_messages::LogEntry entry, int command = 0){
         if(state != NodeState::Leader){
             // No, I am not the Leader, so please find the Leader first of all.
-            debug("Not Leader!!!!!\n");
+            debug_node("Not Leader!!!!!\n");
             return -NUFT_NOT_LEADER;
+        }
+        if(!is_running()){
+            debug_node("Not Running!!!!\n");
+            return -NUFT_FAIL;
         }
         IndexID index = last_log_index() + 1;
         entry.set_term(this->current_term);
@@ -1143,7 +1266,7 @@ CANT_COMMIT:
         logs.push_back(entry);
         if(persister) persister->Dump();
 
-        debug("Append LOCAL log Index %lld, Term %llu, commit_index %lld. Now copy to peers.\n", index, current_term, commit_index);
+        debug_node("Append LOCAL log Index %lld, Term %llu, commit_index %lld. Now copy to peers.\n", index, current_term, commit_index);
         // "The leader appends the command to its log as a new entry, then issues AppendEntries RPCs in parallel..."
         do_append_entries(guard, false);
         return NUFT_OK;
@@ -1190,6 +1313,7 @@ CANT_COMMIT:
         }else{
             update_configuration_joint(guard);
         }
+        persister->Dump();
         return NUFT_OK;
     }
 
@@ -1204,13 +1328,14 @@ CANT_COMMIT:
         std::string conf_str = Configuration::to_string(*trans_conf);
         entry.set_data(conf_str);
         do_log(guard, entry, 1);
+        persister->Dump();
     }
 
     void on_update_configuration_joint(std::lock_guard<std::mutex> & guard, const raft_messages::LogEntry & entry){
 		// Followers received Leader's entry for joint consensus.
         std::string conf_str = entry.data();
         if(trans_conf){
-            debug_node("Receive Leader's entry for joint consensus, but I'm already in state %d.\n", trans_conf->state);
+            // debug_node("Receive Leader's entry for joint consensus, but I'm already in state %d.\n", trans_conf->state);
             return;
         }
         trans_conf = new Configuration(Configuration::from_string(conf_str));
@@ -1223,24 +1348,33 @@ CANT_COMMIT:
                 NodePeer & peer = *add_peer(guard, s);
             }
         }
+        persister->Dump();
     }
 
-    void update_configuration_new(std::lock_guard<std::mutex> & guard){
+    void on_update_configuration_joint_committed(std::lock_guard<std::mutex> & guard){
         // After joint consensus is committed,
         // Leader can now start to switch to C_{new}.
         debug_node("Joint consensus committed.\n");
-        invoke_callback(NUFT_CB_CONF_START, {this, Configuration::State::JOINT});
         assert(trans_conf);
         trans_conf->state = Configuration::State::JOINT;
+        persister->Dump();
+        invoke_callback(NUFT_CB_CONF_START, {this, Configuration::State::JOINT});
+        update_configuration_new(guard);
+    }
+
+    void update_configuration_new(std::lock_guard<std::mutex> & guard){
+        // TODO If we crash at JOINT, then no Leader will issue entry for new configuration.
+        // Need split here
         ::raft_messages::LogEntry entry;
         trans_conf->index2 = last_log_index() + 1;
         entry.set_data("");
 		do_log(guard, entry, 2); 
         trans_conf->state = Configuration::State::JOINT_NEW;
+        persister->Dump();
+        invoke_callback(NUFT_CB_CONF_START, {this, Configuration::State::JOINT_NEW});
     }
 
     void on_update_configuration_new(std::lock_guard<std::mutex> & guard, const raft_messages::LogEntry & entry){
-        debug_node("Receive Leader's entry for new configuration.\n");
         if(!trans_conf){
             debug_node("Receive Leader's entry for new configuration, but I'm not in update conf mode.\n");
             return;
@@ -1249,12 +1383,14 @@ CANT_COMMIT:
             debug_node("Receive Leader's entry for new configuration, but my state = %d.\n", trans_conf->state);
             return;
         }
+        // debug_node("Receive Leader's entry for new configuration.\n");
         trans_conf->state = Configuration::State::JOINT_NEW;
         trans_conf->index2 = entry.index();
         for(auto p: trans_conf->rem){
             debug_node("Remove peer %s\n", p.c_str());
             remove_peer(guard, p);
         }
+        persister->Dump();
     }
 
     void update_configuration_finish(std::lock_guard<std::mutex> & guard){
@@ -1272,11 +1408,12 @@ CANT_COMMIT:
         if(Nuke::contains(trans_conf->rem, name)){
             debug_node("Leader is not in C_{new}, step down and stop.\n");
             become_follower(current_term);
-            stop();
+            stop(guard);
         }
         delete trans_conf;
         trans_conf = nullptr;
         debug_node("Leader finish updating config.\n");
+        persister->Dump();
     }
 
     void on_update_configuration_finish(std::lock_guard<std::mutex> & guard){
@@ -1293,20 +1430,38 @@ CANT_COMMIT:
         if(Nuke::contains(trans_conf->rem, name)){
             debug_node("I am not in C_{new}, stop.\n");
             become_follower(current_term);
-            stop();
+            stop(guard);
         }
         delete trans_conf;
         trans_conf = nullptr;
         debug_node("Follower finish updating config.\n");
+        persister->Dump();
     }
 
     RaftNode(const std::string & addr) : state(NodeState::NotRunning), name(addr) {
         std::memset(callbacks, 0, sizeof callbacks);
+        current_term = default_term_cursor;
+        vote_for = vote_for_none;
+        leader_name = "";
+        trans_conf = nullptr;
         persister = new Persister{this};
+        commit_index = default_index_cursor;
+        last_applied = default_index_cursor;
+        paused = false;
+        tobe_destructed = false;
+        last_tick = 0; 
+        elect_timeout_due = 0; 
+        election_fail_timeout_due = 0; 
+        vote_got = 0;
+        new_vote = 0;
+        old_vote = 0;
+        raft_message_server = nullptr;
         using namespace std::chrono_literals;
 #if defined(USE_GRPC_SYNC) && !defined(USE_GRPC_SYNC_BARE)
-        sync_client_task_queue = std::make_shared<Nuke::ThreadExecutor>(GRPC_SYNC_CONCUR_LEVEL);
+        // sync_client_task_queue = std::make_shared<Nuke::ThreadExecutor>(GRPC_SYNC_CONCUR_LEVEL);
+        sync_client_task_queue = new Nuke::ThreadExecutor(GRPC_SYNC_CONCUR_LEVEL);
 #endif
+        start_timepoint = get_current_ms();
         timer_thread = std::thread([&]() {
             while (1) {
                 if(tobe_destructed){
@@ -1320,20 +1475,31 @@ CANT_COMMIT:
     RaftNode(const RaftNode &) = delete;
     ~RaftNode() {
         debug_node("Destruct RaftNode.\n");
-        GUARD
-        tobe_destructed = true;
-        state = NodeState::NotRunning;
-        delete raft_message_server;
-        debug_node("Wait join\n");
-        timer_thread.join();
-        for (auto & pp : this->peers) {
-            remove_peer(guard, pp.first);
+        {
+            GUARD
+            tobe_destructed = true;
+            state = NodeState::NotRunning;
+            delete raft_message_server;
+            raft_message_server = nullptr;
+            debug_node("Wait join\n");
+            timer_thread.join();
+            debug_node("Joined\n");
+            reset_peers(guard);
+            debug_node("Peers clear\n");
+            if(trans_conf){
+                delete trans_conf;
+            }
         }
-        if(trans_conf){
-            delete trans_conf;
-        }
+        // TODO this will sometimes blocks at thread pool.
+        // I think it may because of:
+        // 1. ~RaftNode locks mut
+        // 2. delete sync_client_task_queue wait all pending RPCs are handled
+        // 3. one response arrived, e.g. call `on_append_entries_response`
+        // 4. it will try to acquire mut again
+        // 5. deadlock
+        delete sync_client_task_queue;
+        debug_node("Destruct finish\n");
     }
-
 };
 
 RaftNode * make_raft_node(const std::string & addr);
