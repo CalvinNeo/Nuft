@@ -59,7 +59,10 @@ message InstallSnapshotRequest {
 message InstallSnapshotResponse{
     required uint64 term = 1;
     required string name = 2;
-    required uint64 time = 3;
+    required int64 last_included_index = 3;
+    required int64 last_included_term = 4;
+	required bool success = 5;
+    required uint64 time = 6;
 }
 
 message ConfRecord{

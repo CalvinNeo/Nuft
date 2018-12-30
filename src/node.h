@@ -47,7 +47,7 @@ static constexpr uint64_t default_election_fail_timeout_interval = 3000; //
 #define vote_for_none ""
 
 #define GUARD std::lock_guard<std::mutex> guard((mut));
-
+// #define USE_GRPC_ASYNC
 #if defined(USE_GRPC_ASYNC)
 #undef USE_GRPC_SYNC
 #define USE_GRPC_ASYNC
@@ -106,11 +106,20 @@ struct NuftCallbackArg{
     struct RaftNode * node;
     int a1 = 0;
     int a2 = 0;
+    void * p1 = nullptr;
 };
 typedef int NuftResult;
 // typedef NuftResult NuftCallbackFunc(NUFT_CB_TYPE, NuftCallbackArg *);
 // typedef std::function<NuftResult(NUFT_CB_TYPE, NuftCallbackArg *)> NuftCallbackFunc;
 typedef std::function<NuftResult(NUFT_CB_TYPE, NuftCallbackArg *)> NuftCallbackFunc;
+
+struct ApplyMessage{
+    IndexID index = default_index_cursor;
+    TermID term = default_term_cursor;
+    std::string name;
+    bool from_snapshot = false;
+    std::string data;
+};
 
 
 struct RaftNode {
@@ -167,7 +176,7 @@ struct RaftNode {
         Configuration(const std::vector<std::string> & a, const std::vector<std::string> & r, const std::vector<NodeName> & o) : app(a), rem(r), old(o){
             
         }
-		Configuration(const std::vector<std::string> & a, const std::vector<std::string> & r, const std::map<NodeName, NodePeer*> & o, const NodeName & leader_exclusive) : app(a), rem(r){
+        Configuration(const std::vector<std::string> & a, const std::vector<std::string> & r, const std::map<NodeName, NodePeer*> & o, const NodeName & leader_exclusive) : app(a), rem(r){
             for(auto && p: o){
                 old.push_back(p.first);
             }
@@ -287,14 +296,14 @@ struct RaftNode {
         if(callbacks[type] != nullptr){
             return (callbacks[type])(type, &arg);
         }
-        return -NUFT_FAIL;
+        return NUFT_OK;
     }
 
     IndexID get_base_index() const{
         if(logs.size() == 0){
             return default_index_cursor;
         }
-		return logs[0].index();    
+        return logs[0].index();    
     }
     IndexID last_log_index() const {
         if(logs.size() == 0){
@@ -322,14 +331,22 @@ struct RaftNode {
             assert(false);
         }
     }
+    size_t find_entry(IndexID index, TermID term){
+        for(int i = logs.size() - 1; i >= 0; i--){
+            if(logs[i].term() == term && logs[i].index() == index){
+                return i;
+            }
+        }
+        return default_index_cursor;
+    }
     size_t cluster_size() const {
         return peers.size() + 1;
     }
 
     bool enough_votes(size_t vote) const {
         // Is `vote` votes enough
-		// TODO votes can be cached.
-		size_t voters = compute_votes_thres();
+        // TODO votes can be cached.
+        size_t voters = compute_votes_thres();
         return vote > voters / 2;
     }
     size_t compute_votes_thres() const {
@@ -339,7 +356,7 @@ struct RaftNode {
                 voters ++;
             }
         }
-		return voters;
+        return voters;
     }
     
     template <typename F>
@@ -355,12 +372,12 @@ struct RaftNode {
             new_vote = (trans_conf->is_in_new(name) ? 1 : 0);
             for(auto & pp: peers){
                 NodePeer & peer = *pp.second;
-				assert(peer.voting_rights);
-				if (f(peer)) {
+                assert(peer.voting_rights);
+                if (f(peer)) {
                     // If got votes from peer
                     if(trans_conf->is_in_old(peer.name)){
                         old_vote++;
-					}
+                    }
                     if(trans_conf->is_in_new(peer.name)){
                         new_vote++;
                     }
@@ -369,7 +386,7 @@ struct RaftNode {
             if(old_vote > trans_conf->oldvote_thres / 2 && new_vote > trans_conf->newvote_thres / 2){
                 return 1;
             }else{
-			    return -1;
+                return -1;
             }
         } else if(trans_conf && Nuke::in(trans_conf->state, {Configuration::State::NEW, Configuration::State::JOINT_NEW})){
             // Require majority of C_{new}
@@ -386,13 +403,13 @@ struct RaftNode {
             if(new_vote > trans_conf->newvote_thres / 2){
                 return 1;
             }else{
-			    return -1;
+                return -1;
             }
         }
         return 0;
     }
     
-    const NodeName get_leader_name() const{
+    NodeName get_leader_name() const{
         // This function helps Clients to locate Leader.
         // Keep in mind that in raft, Clients only communicate with Leader.
         if(state == NodeState::Leader){
@@ -469,6 +486,11 @@ VOTE_NOT_ENOUGH:
                 reset_election_timeout();
                 invoke_callback(NUFT_CB_ELECTION_END, {this, ELE_T});
             }
+        }
+
+        if(trans_conf && trans_conf->state == Configuration::State::JOINT && commit_index >= trans_conf->index){
+            GUARD
+            update_configuration_new(guard);
         }
     }
 
@@ -622,9 +644,21 @@ VOTE_NOT_ENOUGH:
         reset_peers(guard);
     }
 
-    void do_apply() {
-        invoke_callback(NUFT_CB_ON_APPLY, {this});
-        // TODO advance last_applied
+    void do_apply(bool from_snapshot = false) {
+        GUARD
+        do_apply(guard, from_snapshot);
+    }
+    void do_apply(std::lock_guard<std::mutex> & guard, bool from_snapshot = false) {
+        for(IndexID i = last_applied + 1; i <= commit_index; i++){
+            ApplyMessage * applymsg = new ApplyMessage{i, gl(i).term(), name, from_snapshot, gl(i).data()};
+            NuftResult res = invoke_callback(NUFT_CB_ON_APPLY, {this, 0, 0, applymsg});
+            if(res != NUFT_OK){
+                debug_node("Apply fail at %lld\n", i);
+            }else{
+                last_applied = i;
+            }
+            delete applymsg;
+        }
     }
 
     void switch_to(NodeState new_state) {
@@ -701,13 +735,86 @@ VOTE_NOT_ENOUGH:
             debug_node("We can only snapshot until last_applied.\n");
             return NUFT_FAIL;
         }
+
+        // TODO create snapshot, truncate log, persist
+    }
+
+    void do_send_install_snapshot(std::lock_guard<std::mutex> & guard, const NodePeer & peer){
+        // NOTICE We don't loop over all peers because we want to patch this function into `do_append_entries`
+        if(!peer.send_enabled) return;
+        if(peer.next_index > get_base_index()) {
+            return;
+        }
+        raft_messages::InstallSnapshotRequest request;
+        IndexID base = get_base_index();
+        request.set_name(name);
+        request.set_term(current_term);
+        request.set_last_included_index(get_base_index());
+        request.set_last_included_term(get_base_index()==default_index_cursor? default_term_cursor: gl(get_base_index()).term());
+        request.set_data(gl(base).data()); // TODO get snapshot from log entry (term:last_included_term, index:last_included_index)
+        request.set_time(get_current_ms());
+        
+        debug_node("Send InstallSnapshotRequest from %s to %s\n", name.c_str(), peer.name.c_str());
+        peer.raft_message_client->AsyncInstallSnapshot(request);
     }
 
     int on_install_snapshot_request(raft_messages::InstallSnapshotResponse* response_ptr, const raft_messages::InstallSnapshotRequest& request) {
+        GUARD
+
+        if((uint64_t)request.time() < (uint64_t)start_timepoint){
+            return;
+        }
+        raft_messages::InstallSnapshotResponse & response = *response_ptr;
+        response.set_name(name);
+        response.set_success(false);
+
+        if(handle_request_routine(request)){
+            response.set_term(current_term);
+        }else{
+            goto end;
+        }
+
+        // TODO create snapshot, truncate log, persist
+        // NOTICE We must save a copy of `get_base_index()`, because it will be modified.
+        IndexID base = get_base_index();
+        gl(base).set_index(request.last_included_index());
+        gl(base).set_term(request.last_included_term());
+        gl(base).set_data(request.data());
+        assert(last_applied < request.last_included_index());
+        assert(commit_index < request.last_included_index());
+
+        last_applied = request.last_included_index();
+        commit_index = request.last_included_index();
+        persister->Dump();
+        response.set_success(true);
+end:
         return 0;
     }
 
-    void on_install_snapshot_response(const raft_messages::InstallSnapshotResponse& response) {
+    void on_install_snapshot_response(const raft_messages::InstallSnapshotResponse & response) {
+        GUARD
+
+        if((uint64_t)response.time() < (uint64_t)start_timepoint){
+            return;
+        }
+        if (state != NodeState::Leader) {
+            return;
+        }
+        if (!response.success()) {
+            debug_node("Peer %s returns InstallSnapshotResponse: FAILED\n", response.name().c_str());
+            return;
+        }
+        if (response.term() > current_term) {
+            become_follower(response.term());
+            return;
+        }
+
+        if(!Nuke::contains(peers, response.name())){
+            return;
+        }
+        NodePeer & peer = *(peers[response.name()]);
+        peer.next_index = response.last_included_index() + 1;
+        peer.match_index = response.last_included_index();
     }
 
     void do_election() {
@@ -759,7 +866,6 @@ VOTE_NOT_ENOUGH:
             return -1;
         }
         GUARD
-        
             
         raft_messages::RequestVoteResponse & response = *response_ptr;
         response.set_name(name);
@@ -899,33 +1005,12 @@ end:
         }
     }
 
-    int on_append_entries_request(raft_messages::AppendEntriesResponse * response_ptr, const raft_messages::AppendEntriesRequest & request) {
-        // When a Follower/Candidate receive `AppendEntriesResponse` from Leader,
-        // Try append entries, then return a `AppendEntriesResponse`.
-        std::string peer_name = request.name();
-        if((!is_running()) || (!is_peer_receive_enabled(peer_name))){
-            #if !defined(_HIDE_NOEMPTY_REPEATED_APPENDENTRY_REQUEST) && !defined(_HIDE_PAUSED_NODE_NOTICE)
-            #if defined(_HIDE_HEARTBEAT_NOTICE)
-            if(request.entries().size() == 0){}else
-            #endif
-            debug_node("Ignore AppendEntriesRequest from %s, I state %d paused %d, Peer running %d.\n", request.name().c_str(), 
-                    state, paused, is_peer_receive_enabled(peer_name));
-            #endif
-            return -1;
-        }
-        if((uint64_t)request.time() < (uint64_t)start_timepoint){
-            return -1;
-        }
-        GUARD
-        raft_messages::AppendEntriesResponse & response = *response_ptr;
-        response.set_name(name);
-        response.set_success(false);
-
-        IndexID prev_i = request.prev_log_index(), prev_j = 0;
+    template <typename R>
+    bool handle_request_routine(const R & request){
 
         if (request.term() < current_term) {
-            debug_node("Reject AppendEntriesRequest from %s, because it has older term %llu, me %llu. It maybe a out-dated Leader\n", request.name().c_str(), request.term(), current_term);
-            goto end;
+            debug_node("Reject AppendEntriesRequest/InstallSnapshotRequest from %s, because it has older term %llu, me %llu. It maybe a out-dated Leader\n", request.name().c_str(), request.term(), current_term);
+            return false;
         }
 
         // **Current** Leader is still alive.
@@ -935,7 +1020,7 @@ end:
         if (request.term() > current_term) {
             // Discover a request with newer term.
             print_state();
-            debug_node("Become Follower: Receive AppendEntriesRequest from %s with newer term %llu, me %llu, my time %llu, peer time %llu.\n", 
+            debug_node("Become Follower: Receive AppendEntriesRequest/InstallSnapshotRequest from %s with newer term %llu, me %llu, my time %llu, peer time %llu.\n", 
                 request.name().c_str(), request.term(), current_term, (uint64_t)start_timepoint % 10000, (uint64_t)request.time() % 10000);
             become_follower(request.term());
             leader_name = request.name();
@@ -964,9 +1049,39 @@ end:
             leader_name = request.name();
             invoke_callback(NUFT_CB_ELECTION_END, {this, ELE_FAIL});
         }
+        return true;
+    }
 
+    int on_append_entries_request(raft_messages::AppendEntriesResponse * response_ptr, const raft_messages::AppendEntriesRequest & request) {
+        // When a Follower/Candidate receive `AppendEntriesResponse` from Leader,
+        // Try append entries, then return a `AppendEntriesResponse`.
+        std::string peer_name = request.name();
+        if((!is_running()) || (!is_peer_receive_enabled(peer_name))){
+            #if !defined(_HIDE_NOEMPTY_REPEATED_APPENDENTRY_REQUEST) && !defined(_HIDE_PAUSED_NODE_NOTICE)
+            #if defined(_HIDE_HEARTBEAT_NOTICE)
+            if(request.entries().size() == 0){}else
+            #endif
+            debug_node("Ignore AppendEntriesRequest from %s, I state %d paused %d, Peer running %d.\n", request.name().c_str(), 
+                    state, paused, is_peer_receive_enabled(peer_name));
+            #endif
+            return -1;
+        }
+        if((uint64_t)request.time() < (uint64_t)start_timepoint){
+            return -1;
+        }
+        GUARD
+        raft_messages::AppendEntriesResponse & response = *response_ptr;
+        response.set_name(name);
+        response.set_success(false);
 
-        response.set_term(current_term);
+        IndexID prev_i = request.prev_log_index(), prev_j = 0;
+
+        if(handle_request_routine(request)){
+            response.set_term(current_term);
+        }else{
+            goto end;
+        }
+
         // `request.prev_log_index() == -1` happens at the very beginning when a Leader with no Log, and send heartbeats to others.
         if (request.prev_log_index() >= 0 && request.prev_log_index() > last_log_index()) {
             // I don't have the `prev_log_index()` entry.
@@ -1217,7 +1332,7 @@ NORMAL_TEST_COMMIT:
                 commit_index = new_commit;
                 // "When the entry has been safely replicated, the leader applies the entry to its state machine 
                 // and returns the result of that execution to the client."
-                do_apply();
+                do_apply(guard);
             }else{
                 //if(!heartbeat) 
                     debug_node("Can't advance commit_index to %lld because of inadequate votes of %u.\n", new_commit, commit_vote);
@@ -1271,17 +1386,17 @@ CANT_COMMIT:
         do_append_entries(guard, false);
         return NUFT_OK;
     }
-    bool do_log(std::lock_guard<std::mutex> & guard, const std::string & log_string){
+    NuftResult do_log(std::lock_guard<std::mutex> & guard, const std::string & log_string){
         ::raft_messages::LogEntry entry;
         entry.set_data(log_string);
-        return this->do_log(guard, entry);
+        return do_log(guard, entry);
     }
     // For API usage
     NuftResult do_log(::raft_messages::LogEntry entry, int command = 0){
         GUARD
         return do_log(guard, entry, command);
     }
-    bool do_log(const std::string & log_string){
+    NuftResult do_log(const std::string & log_string){
         GUARD
         return do_log(guard, log_string);
     }
@@ -1307,8 +1422,8 @@ CANT_COMMIT:
             }
         }
         if(app.size() > 0){
-			// We don't send log immediately. 
-			// Wait new nodes to catch up with the Leader.
+            // We don't send log immediately. 
+            // Wait new nodes to catch up with the Leader.
             debug_node("New nodes added, switch to STAGING mode.\n");
         }else{
             update_configuration_joint(guard);
@@ -1332,7 +1447,7 @@ CANT_COMMIT:
     }
 
     void on_update_configuration_joint(std::lock_guard<std::mutex> & guard, const raft_messages::LogEntry & entry){
-		// Followers received Leader's entry for joint consensus.
+        // Followers received Leader's entry for joint consensus.
         std::string conf_str = entry.data();
         if(trans_conf){
             // debug_node("Receive Leader's entry for joint consensus, but I'm already in state %d.\n", trans_conf->state);
@@ -1359,7 +1474,6 @@ CANT_COMMIT:
         trans_conf->state = Configuration::State::JOINT;
         persister->Dump();
         invoke_callback(NUFT_CB_CONF_START, {this, Configuration::State::JOINT});
-        update_configuration_new(guard);
     }
 
     void update_configuration_new(std::lock_guard<std::mutex> & guard){
@@ -1368,7 +1482,7 @@ CANT_COMMIT:
         ::raft_messages::LogEntry entry;
         trans_conf->index2 = last_log_index() + 1;
         entry.set_data("");
-		do_log(guard, entry, 2); 
+        do_log(guard, entry, 2); 
         trans_conf->state = Configuration::State::JOINT_NEW;
         persister->Dump();
         invoke_callback(NUFT_CB_CONF_START, {this, Configuration::State::JOINT_NEW});
@@ -1478,18 +1592,25 @@ CANT_COMMIT:
         {
             GUARD
             tobe_destructed = true;
+            paused = true;
             state = NodeState::NotRunning;
+            debug_node("Reset Peers \n");
+            reset_peers(guard);
+        }
+            debug_node("Delete Server\n");
+            // This may block forever even we called shutdown.
             delete raft_message_server;
             raft_message_server = nullptr;
+        {
+            GUARD
             debug_node("Wait join\n");
             timer_thread.join();
             debug_node("Joined\n");
-            reset_peers(guard);
-            debug_node("Peers clear\n");
             if(trans_conf){
                 delete trans_conf;
             }
         }
+#if defined(USE_GRPC_SYNC) && !defined(USE_GRPC_SYNC_BARE)
         // TODO this will sometimes blocks at thread pool.
         // I think it may because of:
         // 1. ~RaftNode locks mut
@@ -1498,6 +1619,7 @@ CANT_COMMIT:
         // 4. it will try to acquire mut again
         // 5. deadlock
         delete sync_client_task_queue;
+#endif
         debug_node("Destruct finish\n");
     }
 };

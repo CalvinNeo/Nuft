@@ -21,6 +21,27 @@
 #include "server.h"
 #include "node.h"
 #include <iostream>
+
+RaftServerContext::RaftServerContext(struct RaftNode * node){
+    service = new RaftMessagesServiceImpl(node);
+#if !defined(_HIDE_GRPC_NOTICE)
+    debug("GRPC: Listen to %s\n", node->name.c_str());
+#endif
+    builder = new ServerBuilder();
+    builder->AddListeningPort(node->name, grpc::InsecureServerCredentials());
+    builder->RegisterService(service);
+    server = std::unique_ptr<Server>{builder->BuildAndStart()};
+    wait_thread = std::thread([&](){server->Wait();});
+}
+RaftServerContext::~RaftServerContext(){
+    debug("Wait shutdown\n");
+    server->Shutdown();
+    wait_thread.join();
+    debug("Joined\n");
+    delete service;
+    delete builder;
+}
+
 Status RaftMessagesServiceImpl::RequestVote(ServerContext* context,
         const raft_messages::RequestVoteRequest* request,
         raft_messages::RequestVoteResponse* response)
@@ -75,56 +96,6 @@ Status RaftMessagesServiceImpl::InstallSnapshot(ServerContext* context,
     }else{
         return Status(grpc::StatusCode::UNAVAILABLE, "Peer is not ready for this request.");
     }
-}
-
-void RaftMessagesClientAsync::AsyncCompleteRpc()
-{
-    void * got_tag;
-    bool ok = false;
-    while (this->cq.Next(&got_tag, &ok))
-    {
-        AsyncClientCallBase * call_base = static_cast<AsyncClientCallBase *>(got_tag);
-        if (call_base->type == 1) {
-            // This is a response to RequestVote call
-            AsyncClientCall<RequestVoteResponse> * call =
-                dynamic_cast<AsyncClientCall<RequestVoteResponse> *>(call_base);
-            if(call->status.ok()){
-                // debug("Receive Async RequestVoteResponse from Peer %s\n", call->context.peer().c_str());
-                raft_node->on_vote_response(call->response);
-            }
-        } else if (call_base->type == 2) {
-            // This is a response to AppendEntries call
-            AsyncClientCall<AppendEntriesResponse> * call =
-                dynamic_cast<AsyncClientCall<AppendEntriesResponse> *>(call_base);
-            if(call->status.ok()){
-                // debug("Receive Async AppendEntriesResponse from Peer %s\n", call->context.peer().c_str());
-                // TODO Replace true by real value of heartbeat
-                raft_node->on_append_entries_response(call->response, true);
-            }
-        }else if (call_base->type == 3) {
-            // This is a response to InstallSnapshot call
-            AsyncClientCall<InstallSnapshotResponse> * call =
-                dynamic_cast<AsyncClientCall<InstallSnapshotResponse> *>(call_base);
-            if(call->status.ok()){
-                raft_node->on_install_snapshot_response(call->response);
-            }
-        }
-
-        delete call_base;
-    }
-}
-
-
-RaftMessagesClientAsync::RaftMessagesClientAsync(const char * addr, struct RaftNode * _raft_node) : raft_node(_raft_node), peer_name(addr) {
-    std::shared_ptr<Channel> channel = grpc::CreateChannel(addr, grpc::InsecureChannelCredentials());
-    debug("Create channel from host %s to remote %s\n", raft_node->name.c_str(), addr);
-    stub = raft_messages::RaftMessages::NewStub(channel);
-    cq_thread = std::thread(&RaftMessagesClientAsync::AsyncCompleteRpc, this);
-    cq_thread.detach(); // `std::thread` destructs as the object is destroyed
-}
-
-RaftMessagesClientAsync::RaftMessagesClientAsync(const std::string & addr, struct RaftNode * _raft_node) : RaftMessagesClientAsync(addr.c_str(), _raft_node) {
-
 }
 
 
@@ -249,23 +220,4 @@ RaftMessagesClientSync::RaftMessagesClientSync(const char * addr, struct RaftNod
 
 RaftMessagesClientSync::RaftMessagesClientSync(const std::string & addr, struct RaftNode * _raft_node) : RaftMessagesClientSync(addr.c_str(), _raft_node) {
 
-}
-
-
-RaftServerContext::RaftServerContext(struct RaftNode * node){
-    service = new RaftMessagesServiceImpl(node);
-#if !defined(_HIDE_GRPC_NOTICE)
-    debug("GRPC: Listen to %s\n", node->name.c_str());
-#endif
-    builder = new ServerBuilder();
-    builder->AddListeningPort(node->name, grpc::InsecureServerCredentials());
-    builder->RegisterService(service);
-    server = std::unique_ptr<Server>{builder->BuildAndStart()};
-    wait_thread = std::thread([&](){server->Wait();});
-}
-RaftServerContext::~RaftServerContext(){
-    server->Shutdown();
-    wait_thread.join();
-    delete service;
-    delete builder;
 }

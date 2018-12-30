@@ -720,9 +720,9 @@ TEST(Config, AddPeerLeaderLost){
     // Give time for leader to re-win a election, and replicate. 
     // see addpeerleaderlost2.log
     WaitAny(leader, NUFT_CB_CONF_START, [&](int type, NuftCallbackArg * args){
-    //        if(args->a1 == RaftNode::Configuration::State::JOINT){
+            if(args->a1 == RaftNode::Configuration::State::JOINT){
     // TODO If we crash at JOINT, then no Leader will issue entry for new configuration.
-            if(args->a1 == RaftNode::Configuration::State::JOINT_NEW){
+    //        if(args->a1 == RaftNode::Configuration::State::JOINT_NEW){
                 // Now joint consensus is committed, but we Disable Leader.
                 printf("GTEST: Joint consensus committed, disable Leader Again.\n");
                 // NOTICE the lambda holds the lock of raft node.

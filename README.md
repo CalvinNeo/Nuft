@@ -17,6 +17,19 @@ Run all tests by
 ```
 ./test
 ```
+# Usage
+## API 
+1. `NuftResult RaftNode::do_log(const std::string & log_string)`
+2. `NuftResult RaftNode::do_log(raft_messages::LogEntry entry, int command = 0)`
+3. `void RaftNode::start()`
+4. `void RaftNode::start(const std::string & new_name)`
+5. `void RaftNode::stop()`
+6. `void RaftNode::resume()`
+7. `NuftResult do_install_snapshot(IndexID last_included_index, const std::string & state_machine_state)`
+8. `NuftResult update_configuration(const std::vector<std::string> & app, const std::vector<std::string> & rem)`
+9. `std::string get_leader_name() const`
+
+## Callbacks
 
 # License
 

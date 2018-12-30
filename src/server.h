@@ -135,7 +135,7 @@ struct RaftMessagesClientAsync {
         call->response_reader->Finish(&call->response, &call->status, (void*)call);
     }
 
-    void AsyncAppendEntries(const AppendEntriesRequest& request)
+    void AsyncAppendEntries(const AppendEntriesRequest& request, bool heartbeat)
     {
         AsyncClientCall<AppendEntriesResponse> * call = new AsyncClientCall<AppendEntriesResponse>();
         call->type = 2;
@@ -155,7 +155,8 @@ struct RaftMessagesClientAsync {
     RaftMessagesClientAsync(const char * addr, struct RaftNode * _raft_node);
     RaftMessagesClientAsync(const std::string & addr, struct RaftNode * _raft_node);
     ~RaftMessagesClientAsync() {
-
+        raft_node = nullptr;
+        cq.Shutdown();
     }
 private:
     std::unique_ptr<raft_messages::RaftMessages::Stub> stub;
