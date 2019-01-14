@@ -102,6 +102,12 @@ enum NUFT_CB_TYPE {
     NUFT_CB_ON_REPLICATE,
     NUFT_CB_SIZE,
 };
+enum NUFT_CMD_TYPE {
+    NUFT_CMD_NORMAL = 0,
+    NUFT_CMD_TRANS = 1,
+    NUFT_CMD_SNAPSHOT = 2,
+    NUFT_CMD_SIZE,
+};
 struct NuftCallbackArg{
     struct RaftNode * node;
     int a1 = 0;
@@ -494,8 +500,8 @@ VOTE_NOT_ENOUGH:
         }
     }
 
-    void start() {
-        debug_node("Start node. Switch state to Follower.\n");
+    void run() {
+        debug_node("Run node. Switch state to Follower.\n");
         if (state != NodeState::NotRunning) {
             return;
         }
@@ -505,10 +511,10 @@ VOTE_NOT_ENOUGH:
         persister->Dump(true);
         reset_election_timeout();
     }
-    void start(const std::string & new_name){
+    void run(const std::string & new_name){
         name = new_name;
         persister->Load();
-        start();
+        run();
     }
     void apply_conf(std::lock_guard<std::mutex> & guard, const Configuration & conf){
         debug_node("Apply conf: old %u, app %u, rem %u\n", conf.old.size(), conf.app.size(), conf.rem.size());
@@ -649,6 +655,7 @@ VOTE_NOT_ENOUGH:
         do_apply(guard, from_snapshot);
     }
     void do_apply(std::lock_guard<std::mutex> & guard, bool from_snapshot = false) {
+        assert(!(from_snapshot && gl(last_applied + 1).command() != NUFT_CMD_SNAPSHOT));
         for(IndexID i = last_applied + 1; i <= commit_index; i++){
             ApplyMessage * applymsg = new ApplyMessage{i, gl(i).term(), name, from_snapshot, gl(i).data()};
             NuftResult res = invoke_callback(NUFT_CB_ON_APPLY, {this, 0, 0, applymsg});
@@ -721,6 +728,21 @@ VOTE_NOT_ENOUGH:
         last_tick = 0;
     }
 
+    void truncate_log(IndexID last_included_index, TermID last_included_term){
+        // TODO Can move some element from `logs` to `new_entries`
+        std::vector<::raft_messages::LogEntry> new_entries;
+        ::raft_messages::LogEntry entry;
+        entry.set_term(last_included_term);
+        entry.set_index(last_included_index);
+        entry.set_command(NUFT_CMD_SNAPSHOT); // This is a snapshot
+        new_entries.push_back(entry);
+        size_t i = find_entry(last_included_index, last_included_term);
+        if (i != -1 && i + 1 < logs.size()) {
+            new_entries.insert(new_entries.end(), logs.begin() + i + 1, logs.end());
+        }
+        logs = new_entries;
+    }
+
     NuftResult do_install_snapshot(IndexID last_included_index, const std::string & state_machine_state){
         GUARD
         if(last_log_index() <= get_base_index()){
@@ -736,7 +758,16 @@ VOTE_NOT_ENOUGH:
             return NUFT_FAIL;
         }
 
-        // TODO create snapshot, truncate log, persist
+        // Create snapshot, truncate log, persist
+        TermID last_included_term = gl(last_included_index).term();
+        // (last_included_index, last_included_term) should be 1st in new `logs`.
+        logs.erase(logs.begin(), logs.begin() + last_included_index - get_base_index());
+        logs[0].set_index(last_included_index);
+        logs[0].set_term(last_included_term);
+        logs[0].set_command(NUFT_CMD_SNAPSHOT);
+        logs[0].set_data(state_machine_state);
+
+        if(persister) persister->Dump();
     }
 
     void do_send_install_snapshot(std::lock_guard<std::mutex> & guard, const NodePeer & peer){
@@ -747,10 +778,14 @@ VOTE_NOT_ENOUGH:
         }
         raft_messages::InstallSnapshotRequest request;
         IndexID base = get_base_index();
+        if(gl(base).command() != NUFT_CMD_SNAPSHOT){
+            debug_node("gl(%lld).command() != SNAPSHOT", base);
+            exit(-1);
+        }
         request.set_name(name);
         request.set_term(current_term);
-        request.set_last_included_index(get_base_index());
-        request.set_last_included_term(get_base_index()==default_index_cursor? default_term_cursor: gl(get_base_index()).term());
+        request.set_last_included_index(base);
+        request.set_last_included_term(base==default_index_cursor? default_term_cursor: gl(base).term());
         request.set_data(gl(base).data()); // TODO get snapshot from log entry (term:last_included_term, index:last_included_index)
         request.set_time(get_current_ms());
         
@@ -774,20 +809,22 @@ VOTE_NOT_ENOUGH:
             goto end;
         }
 
-        // TODO create snapshot, truncate log, persist
+        // Create snapshot, truncate log, persist
         // NOTICE We must save a copy of `get_base_index()`, because it will be modified.
-        IndexID base = get_base_index();
-        gl(base).set_index(request.last_included_index());
-        gl(base).set_term(request.last_included_term());
-        gl(base).set_data(request.data());
-        assert(last_applied < request.last_included_index());
-        assert(commit_index < request.last_included_index());
-
-        last_applied = request.last_included_index();
+        truncate_log(request.last_included_index(), request.last_included_term());
+        logs[0].set_command(NUFT_CMD_SNAPSHOT);
+        logs[0].set_data(request.data());
+        // Below two asserts DO NOT STAND.
+        // assert(last_applied < request.last_included_index());
+        // assert(commit_index < request.last_included_index());
         commit_index = request.last_included_index();
+        last_applied = commit_index - 1; // Force apply the snapshot
+        do_apply(1);
+
         persister->Dump();
         response.set_success(true);
 end:
+        response.set_time(get_current_ms());
         return 0;
     }
 
@@ -969,39 +1006,44 @@ end:
         for (auto & pp : this->peers) {
             NodePeer & peer = *pp.second;
             if(!peer.send_enabled) continue;
-            // We copy log entries to peer, from `prev_log_index`.
-            // This may fail when "an existing entry conflicts with a new one (same index but different terms)"
-            IndexID prev_log_index = peer.next_index - 1;
-            // What if entry prev_log_index not exist? 
-            // We add rules in `on_append_entries_response`, now peer.next_index can't be set GT last_log_index() + 1
-            TermID prev_log_term = prev_log_index > default_index_cursor ? gl(prev_log_index).term() : default_term_cursor;
-            raft_messages::AppendEntriesRequest request;
-            request.set_name(name);
-            request.set_term(current_term);
-            request.set_prev_log_index(prev_log_index);
-            request.set_prev_log_term(prev_log_term);
-            request.set_leader_commit(commit_index);
-            request.set_time(get_current_ms());
-            // Add entries to request
-            // NOTICE Even this is a heartbeat RPC, we still need to check entries.
-            // Because some nodes may suffer from network failure etc., 
-            // and fail to update their log when we firstly sent entries in `do_log`.
-            if(peer.next_index < last_log_index() + 1){
-                if(heartbeat){}else
-                debug_node("Copy to peer %s LogEntries[%lld, %lld]\n", peer.name.c_str(), peer.next_index, last_log_index());
-            }
-            // TODO Handle when logs is compacted
-            assert(peer.next_index >= get_base_index());
-            for (IndexID i = std::max((IndexID)0, peer.next_index); i <= last_log_index() ; i++) {
-                raft_messages::LogEntry & entry = *(request.add_entries());
-                entry = gl(i);
-            }
+            if(peer.next_index <= get_base_index() && get_base_index() > 0){
+                // If lag behind too much
+                do_send_install_snapshot(guard, peer);
+            }else{
+                // We copy log entries to peer, from `prev_log_index`.
+                // This may fail when "an existing entry conflicts with a new one (same index but different terms)"
+                IndexID prev_log_index = peer.next_index - 1;
+                // What if entry prev_log_index not exist? 
+                // We add rules in `on_append_entries_response`, now peer.next_index can't be set GT last_log_index() + 1
+                TermID prev_log_term = prev_log_index > default_index_cursor ? gl(prev_log_index).term() : default_term_cursor;
+                raft_messages::AppendEntriesRequest request;
+                request.set_name(name);
+                request.set_term(current_term);
+                request.set_prev_log_index(prev_log_index);
+                request.set_prev_log_term(prev_log_term);
+                request.set_leader_commit(commit_index);
+                request.set_time(get_current_ms());
+                // Add entries to request
+                // NOTICE Even this is a heartbeat RPC, we still need to check entries.
+                // Because some nodes may suffer from network failure etc., 
+                // and fail to update their log when we firstly sent entries in `do_log`.
+                if(peer.next_index < last_log_index() + 1){
+                    if(heartbeat){}else
+                    debug_node("Copy to peer %s LogEntries[%lld, %lld]\n", peer.name.c_str(), peer.next_index, last_log_index());
+                }
+                // TODO Handle when logs is compacted
+                assert(peer.next_index >= get_base_index());
+                for (IndexID i = std::max((IndexID)0, peer.next_index); i <= last_log_index() ; i++) {
+                    raft_messages::LogEntry & entry = *(request.add_entries());
+                    entry = gl(i);
+                }
 
-            #if defined(_HIDE_HEARTBEAT_NOTICE)
-            if(heartbeat){}else
-            #endif
-            debug_node("Begin sending %s AppendEntriesRequest to %s, size %u.\n", heartbeat ? "heartbeat": "normal", peer.name.c_str(), request.entries_size());
-            peer.raft_message_client->AsyncAppendEntries(request, heartbeat);
+                #if defined(_HIDE_HEARTBEAT_NOTICE)
+                if(heartbeat){}else
+                #endif
+                debug_node("Begin sending %s AppendEntriesRequest to %s, size %u.\n", heartbeat ? "heartbeat": "normal", peer.name.c_str(), request.entries_size());
+                peer.raft_message_client->AsyncAppendEntries(request, heartbeat);
+            }
         }
     }
 
@@ -1099,35 +1141,39 @@ end:
 
         if(request.prev_log_index() == default_index_cursor){
             // If Leader has no entry, then we definately not match.
-            goto NEXT;
+            goto DO_ERASE;
         }
-        TermID wrong_term = gl(request.prev_log_index()).term();
-        if(request.prev_log_term() != wrong_term){
-            for(IndexID i = request.prev_log_index() - 1; i >= default_index_cursor; i--){
-                if(i == default_index_cursor){
-                    debug_node("Revoke last_log_index to %lld, only from here our logs agree.\n", default_index_cursor);
-                    response.set_last_log_index(default_index_cursor);
-                    response.set_last_log_term(default_term_cursor);
-                } else if(gl(i).term() != wrong_term){
-                    debug_node("Revoke last_log_index to %lld, remove all wrong entries of term %llu.\n", i, wrong_term);
-                    response.set_last_log_index(i);
-                    response.set_last_log_term(gl(i).term());
+        if(request.prev_log_index() > get_base_index()){
+            TermID wrong_term = gl(request.prev_log_index()).term();
+            if(request.prev_log_term() != wrong_term){
+                for(IndexID i = request.prev_log_index() - 1; i >= default_index_cursor; i--){
+                    if(i == default_index_cursor){
+                        debug_node("Revoke last_log_index to %lld, only from here our logs agree.\n", default_index_cursor);
+                        response.set_last_log_index(default_index_cursor);
+                        response.set_last_log_term(default_term_cursor);
+                    } else if(gl(i).term() != wrong_term){
+                        debug_node("Revoke last_log_index to %lld, remove all wrong entries of term %llu.\n", i, wrong_term);
+                        response.set_last_log_index(i);
+                        response.set_last_log_term(gl(i).term());
+                    }
+                    goto end2;
                 }
-                goto end2;
             }
         }
-NEXT:
-        if(request.prev_log_index() + 1 <= last_log_index()){
-            debug_node("Erase [%lld, ), last_log_index %lld\n", request.prev_log_index() + 1, last_log_index());
-            logs.erase(logs.begin() + request.prev_log_index() + 1 - get_base_index(), logs.end());
+DO_ERASE:
+        if(request.prev_log_index() >= get_base_index()){
+            if(request.prev_log_index() + 1 <= last_log_index()){
+                debug_node("Erase [%lld, ), last_log_index %lld\n", request.prev_log_index() + 1, last_log_index());
+                logs.erase(logs.begin() + request.prev_log_index() + 1 - get_base_index(), logs.end());
+            }
+            logs.insert(logs.end(), request.entries().begin(), request.entries().end());
         }
-        logs.insert(logs.end(), request.entries().begin(), request.entries().end());
 
         if (request.leader_commit() > commit_index) {
             // Update commit
             // Seems we can't make this assertion here,
             // according to Figure2 Receiver Implementation 5.
-            // see https://thesquareplanet.com/blog/students-guide-to-raft/
+            // Necessary, see https://thesquareplanet.com/blog/students-guide-to-raft/
             // assert(request.leader_commit() <= last_log_index());
             commit_index = std::min(request.leader_commit(), last_log_index());
             debug_node("Leader %s ask me to advance commit_index to %lld.\n", request.name().c_str(), commit_index);

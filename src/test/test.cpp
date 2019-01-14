@@ -12,6 +12,13 @@
 uint16_t new_port_base = 7200;
 uint16_t port_base = 7100;
 std::vector<RaftNode *> nodes;
+struct LogMon{
+    std::string data;
+    bool applied = false;
+};
+std::map<int, LogMon> logs;
+std::string storage = "";
+std::string correct_storage = "";
 
 void FreeRaftNodes(){
     // We move Leaders to the last of vector `nodes`, so we delete them at the end.
@@ -46,7 +53,7 @@ void MakeRaftNodes(int n){
         }
     }
     for(auto nd: nodes){
-        nd->start();
+        nd->run();
     }
 }
 
@@ -57,7 +64,7 @@ RaftNode * AddRaftNode(uint16_t port){
 		// Only set up newly added nodes.
         nd->add_peer(d->name);
 	}
-    nd->start();
+    nd->run();
     nodes.push_back(nd);
 	return nd;
 }
@@ -147,7 +154,7 @@ void CrashNode(RaftNode * victim){
     victim->trans_conf = nullptr;
 }
 void RecoverNode(RaftNode * victim){
-    victim->start(victim->name);
+    victim->run(victim->name);
     EnableNode(victim);
 }
 
@@ -257,6 +264,46 @@ int CheckLog(IndexID index, const std::string & value){
         }
     }
     return support;
+}
+
+void WaitApplied(RaftNode * ob, IndexID index){
+    if(ob->last_applied >= index){
+        return;
+    }
+    WaitAny(ob, NUFT_CB_ON_APPLY, [&](int type, NuftCallbackArg * arg){
+        ApplyMessage * applymsg = (ApplyMessage *)(arg->p1);
+        if(applymsg->index >= index){
+            return 1;
+        }
+        return 0;
+    });
+}
+
+std::mutex monitor_mut;
+template <typename F>
+void MonitorApplied(RaftNode * ob, F f){
+    // std::shared_ptr<std::mutex> pmut = std::make_shared<std::mutex>();
+    ob->callbacks[NUFT_CB_ON_APPLY] = [f](int type, NuftCallbackArg * arg) -> int{
+        std::lock_guard<std::mutex> guard((monitor_mut));
+        ApplyMessage * applymsg = (ApplyMessage *)(arg->p1);
+        // printf("GTEST: storage %s delta %s\n", storage.c_str(), logs[applymsg->index].data.c_str());
+        if(logs.find(applymsg->index) == logs.end()){
+            return NUFT_OK;
+        }
+        if(!logs[applymsg->index].applied){
+            f(applymsg);
+        }else{
+            printf("GTEST: Monitor APPLIED %d\n", applymsg->index);
+        }
+        logs[applymsg->index].applied = true;
+        return NUFT_OK;
+    };
+}
+void StopMonitorApplied(RaftNode * ob){
+    ob->callbacks[NUFT_CB_ON_APPLY] = nullptr;
+}
+void RegisterLog(int index, const std::string & s){
+    logs[index] = LogMon{s, false};
 }
 
 int MajorityCount(int n){
@@ -834,6 +881,83 @@ TEST(Persist, AddPeer){
     std::this_thread::sleep_for(1s);
     ASSERT_EQ(leader->peers.size(), n);
     ASSERT_EQ(nnd->peers.size(), n);
+    FreeRaftNodes();
+}
+
+TEST(Persist, FrequentCrash){
+    int n = 5;
+    ASSERT_GT(n, 2);
+    MakeRaftNodes(n);
+    WaitElection(nodes[0]);
+    using namespace std::chrono_literals;
+    std::this_thread::sleep_for(1s);
+    RaftNode * leader = PickNode({RaftNode::NodeState::Leader});
+    ASSERT_TRUE(leader != nullptr);
+
+    int tot = 100;
+    int crash_interval = 30;
+    for(int i = 0; i < tot; i++){
+        leader->do_log(std::to_string(i) + ";");
+        if(i % crash_interval == 1){
+            WaitApplied(leader, i);
+            for(auto nd: nodes) CrashNode(nd);
+            print_state();
+            for(auto nd: nodes) RecoverNode(nd);
+            print_state();
+            std::this_thread::sleep_for(1s);
+            leader = PickNode({RaftNode::NodeState::Leader});
+            ASSERT_TRUE(leader != nullptr);
+
+        }
+    }
+    std::this_thread::sleep_for(1s);
+    ASSERT_EQ(leader->commit_index, tot - 1);
+    ASSERT_EQ(leader->last_applied, tot - 1);
+    FreeRaftNodes();
+}
+
+TEST(Snapshot, Basic){
+    int n = 5;
+    ASSERT_GT(n, 2);
+    MakeRaftNodes(n);
+    WaitElection(nodes[0]);
+    using namespace std::chrono_literals;
+    std::this_thread::sleep_for(1s);
+    RaftNode * leader = PickNode({RaftNode::NodeState::Leader});
+    ASSERT_TRUE(leader != nullptr);
+
+    int tot = 100;
+    int snap_interval = 30;
+    storage = "";
+    correct_storage = "";
+    MonitorApplied(leader, [](ApplyMessage * applymsg){
+        IndexID index = applymsg->index;
+        assert(logs.find(index) != logs.end());
+        if(applymsg->from_snapshot){
+            storage = applymsg->data;
+        }else{
+            storage += applymsg->data;
+        }
+    });
+    for(int i = 0; i < tot; i++){
+        std::string s = std::to_string(i) + ";";
+        RegisterLog(i, s);
+        leader->do_log(s);
+        correct_storage += s;
+        if(i % snap_interval == snap_interval - 1){
+            std::this_thread::sleep_for(1s);
+            printf("GTEST: APPLIED of %d is %d\n", i, logs[i].applied);
+            ASSERT_EQ(logs[i].applied, true);
+            printf("======================\n");
+            leader->do_install_snapshot(i, storage);
+        }
+    }
+    std::this_thread::sleep_for(4s);
+    ASSERT_EQ(leader->commit_index, tot - 1);
+    ASSERT_EQ(leader->last_applied, tot - 1);
+    ASSERT_LE(leader->logs.size(), snap_interval);
+    ASSERT_EQ(storage, correct_storage);
+    StopMonitorApplied(leader);
     FreeRaftNodes();
 }
 

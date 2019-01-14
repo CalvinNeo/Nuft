@@ -82,7 +82,7 @@ void Persister::Load(){
         }else{
             if(node->trans_conf) delete node->trans_conf;
             node->trans_conf = new RaftNode::Configuration(conf);
-            node->trans_conf->state = confrecord.state();
+            node->trans_conf->state = (RaftNode::Configuration::State)confrecord.state();
             node->trans_conf->index = confrecord.index();
             node->trans_conf->index2 = confrecord.index2();
             node->reset_peers();
