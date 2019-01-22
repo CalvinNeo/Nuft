@@ -6,6 +6,9 @@
 #include <atomic>
 #include <map>
 #include <string>
+#include <queue>
+
+#define _HIDE_DEBUG_INFO
 
 namespace Nuke{
 struct ThreadExecutor{
@@ -13,6 +16,7 @@ struct ThreadExecutor{
     typedef std::function<void()> Task;
     typedef std::pair<std::string, std::function<void()>> CapTask;
     size_t capacity;
+    std::atomic<int> in_use;
 
     bool check_empty_unguard(){
         return tasks.size() == 0;
@@ -20,23 +24,31 @@ struct ThreadExecutor{
 
     ThreadExecutor(size_t _capacity) : capacity(_capacity){
         close_flag.store(true);
+        in_use.store(0);
         auto inner_loop = [this](){
             while(close_flag.load()){
                 std::unique_lock<std::mutex> lk(mut);
                 while(check_empty_unguard()){
                     // Wait until there is work to do.
                     cv_empty.wait(lk);
+                    // If ThreadExecutor is deleted.
                     if(!close_flag.load()){
                         lk.unlock();
                         return;
                     }
                 }
-                CapTask t = tasks.back();
-                tasks.pop_back();
+                CapTask t = tasks.front();
+                tasks.pop();
                 lk.unlock();
-                // printf("Run %s\n", t.first.c_str());
+#if !defined(_HIDE_DEBUG_INFO)
+                printf("Run %s\n", t.first.c_str());
+#endif
+                std::atomic_fetch_add(&in_use, 1);
                 t.second();
-                // printf("Finish %s\n", t.first.c_str());
+                std::atomic_fetch_sub(&in_use, 1);
+#if !defined(_HIDE_DEBUG_INFO)
+                printf("Finish %s\n", t.first.c_str());
+#endif
             }
         };
         ths = new std::thread[capacity](inner_loop);
@@ -49,12 +61,18 @@ struct ThreadExecutor{
 
     void add_task(Task && t){
         std::unique_lock<std::mutex> lk(mut);
-        tasks.push_back(std::make_pair(std::string(""), t));
+        tasks.push(std::make_pair(std::string(""), t));
+#if !defined(_HIDE_DEBUG_INFO)
+        printf("Add Task Running %d Queue %d Capacity %d\n", in_use.load(), tasks.size(), capacity);
+#endif
         cv_empty.notify_one();
     }
     void add_task(const std::string & name, Task && t){
         std::unique_lock<std::mutex> lk(mut);
-        tasks.push_back(std::make_pair(name, t));
+        tasks.push(std::make_pair(name, t));
+#if !defined(_HIDE_DEBUG_INFO)
+        printf("Add Task '%s' Running %d Queue %d Capacity %d\n", name.c_str(), in_use.load(), tasks.size(), capacity);
+#endif
         cv_empty.notify_one();
     }
 
@@ -79,8 +97,15 @@ struct ThreadExecutor{
             }
         }
     }
+
+    int workload() const {
+        return in_use.load();
+    }
+    int in_queue() const {
+        return tasks.size();
+    }
     std::thread * ths;
-    std::vector<CapTask> tasks;
+    std::queue<CapTask> tasks;
     std::mutex mut;
     std::condition_variable cv_empty;
     std::atomic<bool> close_flag;

@@ -6,7 +6,7 @@ Nuft is an C++17 implementation of the Raft protocol.
 1. C++17 standard(e.g. g++ 7.2)
 2. gRPC
 3. [Nuke](https://github.com/CalvinNeo/Nuke), which is already packed in source
-4. gtest
+4. gtest(in /usr/local/lib)
 
 ## Build tests
 Build all tests by
@@ -22,7 +22,7 @@ Run all tests by
 1. `NuftResult RaftNode::do_log(const std::string & log_string)`
 2. `NuftResult RaftNode::do_log(raft_messages::LogEntry entry, int command = 0)`
 3. `void RaftNode::run()`
-4. `void RaftNode::rum(const std::string & new_name)`
+4. `void RaftNode::run(const std::string & new_name)`
 5. `void RaftNode::stop()`
 6. `void RaftNode::resume()`
 7. `NuftResult RaftNode::do_install_snapshot(IndexID last_included_index, const std::string & state_machine_state)`

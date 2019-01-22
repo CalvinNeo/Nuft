@@ -90,6 +90,9 @@ Status RaftMessagesServiceImpl::InstallSnapshot(ServerContext* context,
     #if !defined(_HIDE_HEARTBEAT_NOTICE) && !defined(_HIDE_GRPC_NOTICE)
     debug("GRPC: Receive InstallSnapshot from Peer %s\n", context->peer().c_str());
     #endif
+    if(!raft_node){
+        return Status::OK;
+    }
     int response0 = raft_node->on_install_snapshot_request(response, *request);
     if(response0 == 0){
         return Status::OK;
@@ -116,13 +119,13 @@ void RaftMessagesClientSync::AsyncRequestVote(const RequestVoteRequest& request)
         Status status = strongThis->stub->RequestVote(&context, request, &response);
         if (status.ok()) {
             if(!strongThis->raft_node){
-                debug("Response RaftNode destructed.\n");
+                debug("GRPC: Old Message, Response RaftNode destructed.\n");
                 return;
             }
             // Test whether raft_node_>peers[peer_name] is destructed.
             if(Nuke::contains(strongThis->raft_node->peers, peer_name)){
                 if(request.time() < strongThis->raft_node->start_timepoint){
-                    debug("Response from previous request REJECTED.\n");
+                    debug("GRPC: Old message, Response from previous request REJECTED.\n");
                 }else
                     strongThis->raft_node->on_vote_response(response);
             }
@@ -144,6 +147,16 @@ void RaftMessagesClientSync::AsyncAppendEntries(const AppendEntriesRequest& requ
 {
     std::string peer_name = this->peer_name;
     auto strongThis = shared_from_this();
+#if !defined(_HIDE_GRPC_NOTICE)
+    if(task_queue->workload() == task_queue->capacity){
+        debug("GRPC: TaskQueue Full.\n");
+    }else{
+        debug("GRPC: TaskQueue Running %d Capacity %d Queue %d\n", task_queue->workload(), task_queue->capacity, task_queue->in_queue());
+    }
+#endif
+    if(task_queue->in_queue() > task_queue->capacity * 10){
+        debug("GRPC: Too much in TaskQueue: Running %d Capacity %d Queue %d.\n", task_queue->workload(), task_queue->capacity, task_queue->in_queue());
+    }
 #if defined(USE_GRPC_SYNC_BARE)
     std::thread t = std::thread(
 #else
@@ -153,16 +166,20 @@ void RaftMessagesClientSync::AsyncAppendEntries(const AppendEntriesRequest& requ
         AppendEntriesResponse response;
         ClientContext context;
         Status status = strongThis->stub->AppendEntries(&context, request, &response);
+        #if !defined(_HIDE_GRPC_NOTICE)
+        debug("GRPC send %s -> %s\n", request.name().c_str(), peer_name.c_str());
+        #endif
         if (status.ok()) {
             if(!strongThis->raft_node){
-                debug("Response RaftNode destructed.\n");
+                debug("GRPC: Old Message, Response RaftNode destructed.\n");
                 return;
             }
             if(Nuke::contains(strongThis->raft_node->peers, peer_name)){
                 if(request.time() < strongThis->raft_node->start_timepoint){
-                    debug("Response from previous request REJECTED.\n");
-                }else
+                    debug("GRPC: Old message, Response from previous request REJECTED.\n");
+                }else{
                     strongThis->raft_node->on_append_entries_response(response, heartbeat);
+                }
             }
         } else {
             // #if !defined(_HIDE_GRPC_NOTICE)
@@ -181,23 +198,31 @@ void RaftMessagesClientSync::AsyncAppendEntries(const AppendEntriesRequest& requ
 void RaftMessagesClientSync::AsyncInstallSnapshot(const InstallSnapshotRequest& request)
 {
     std::string peer_name = this->peer_name;
-    struct RaftNode * raft_node = this->raft_node;
+    auto strongThis = shared_from_this();
 #if defined(USE_GRPC_SYNC_BARE)
     std::thread t = std::thread(
 #else
-    task_queue->add_task(
+    task_queue->add_task("I" + request.name() + peer_name,
 #endif
-    [this, request, peer_name, raft_node](){
+    [strongThis, request, peer_name](){
         InstallSnapshotResponse response;
         ClientContext context;
-        Status status = this->stub->InstallSnapshot(&context, request, &response);
+        Status status = strongThis->stub->InstallSnapshot(&context, request, &response);
         if (status.ok()) {
-            if(Nuke::contains(raft_node->peers, peer_name)){
-                this->raft_node->on_install_snapshot_response(response);
+            if(!strongThis->raft_node){
+                debug("GRPC: Old Message, Response RaftNode destructed.\n");
+                return;
+            }
+            if(Nuke::contains(strongThis->raft_node->peers, peer_name)){
+                if(request.time() < strongThis->raft_node->start_timepoint){
+                    debug("GRPC: Old message, Response from previous request REJECTED.\n");
+                }else{
+                    strongThis->raft_node->on_install_snapshot_response(response);
+                }
             }
         } else {
             #if !defined(_HIDE_GRPC_NOTICE)
-            if(!heartbeat) debug("GRPC error %d: %s\n", status.error_code(), status.error_message().c_str());
+            debug("GRPC error %d: %s\n", status.error_code(), status.error_message().c_str());
             #endif
         }
     }
