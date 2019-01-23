@@ -10,6 +10,7 @@ NO_WARN = -w
 TRIM_WARN = -Wno-unused-variable -Wno-unused-but-set-variable -Wformat-security
 GDB_INFO = -g
 CFLAGS = -DPOSIX -fpermissive -std=c++1z -L/usr/local/lib $(GDB_INFO)
+
 GRPC_PKGCONFIG = `pkg-config --libs protobuf grpc++ grpc` 
 ifeq ($(SYSTEM),Darwin)
 LDFLAGS += -DGRPC_VERBOSITY=DEBUG -DGRPC_TRACE=all $(GRPC_PKGCONFIG) -lgrpc++_reflection -ldl 

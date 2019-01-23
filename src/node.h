@@ -637,7 +637,7 @@ VOTE_NOT_ENOUGH:
     void remove_peer(std::lock_guard<std::mutex> & guard, const std::string & peer_name){
         // Must under the protection of mutex
         if(Nuke::contains(peers, peer_name)){
-            debug_node("Remove %s from cluster.\n", peer_name.c_str());
+            debug_node("Remove %s from this->peers.\n", peer_name.c_str());
             peers[peer_name]->send_enabled = false;
             peers[peer_name]->receive_enabled = false;
             // delete peers[peer_name]->raft_message_client;
@@ -684,6 +684,7 @@ VOTE_NOT_ENOUGH:
             }
             delete applymsg;
         }
+        debug_node("Do apply end.\n");
     }
 
     void switch_to(NodeState new_state) {
@@ -1159,6 +1160,7 @@ end:
             // NOTICE Must double check here.
             // Otherwise, a deferred `on_append_entries_request` may not have seen that
             // we removed Leader. See "非常奇怪的Erase.log"
+            debug_node("Ignore AppendEntriesRequest from %s. I don't have this peer.\n", request.name().c_str());
             return -1;
         }
         raft_messages::AppendEntriesResponse & response = *response_ptr;
@@ -1170,6 +1172,7 @@ end:
         if(handle_request_routine(request)){
             response.set_term(current_term);
         }else{
+            // When `handle_request_routine` fails, it prints error messages.
             goto end;
         }
 
@@ -1197,14 +1200,16 @@ end:
             if(request.prev_log_term() != wrong_term){
                 for(IndexID i = request.prev_log_index() - 1; i >= default_index_cursor; i--){
                     if(i == default_index_cursor){
-                        debug_node("Revoke last_log_index to %lld, only from here our logs agree.\n", default_index_cursor);
+                        debug_node("Revoke last_log_index to %lld, remove all wrong entries of term %llu.\n", default_index_cursor, wrong_term);
                         response.set_last_log_index(default_index_cursor);
                         response.set_last_log_term(default_term_cursor);
                     } else if(gl(i).term() != wrong_term){
+                        // Now we found non conflict entries.
                         debug_node("Revoke last_log_index to %lld, remove all wrong entries of term %llu.\n", i, wrong_term);
                         response.set_last_log_index(i);
                         response.set_last_log_term(gl(i).term());
                     }
+                    debug_node("Revoke last_log_index finished.");
                     goto end2;
                 }
             }
@@ -1422,9 +1427,11 @@ end2:
         else{
 NORMAL_TEST_COMMIT:
             size_t commit_vote = 1; // This one is from myself.
+            std::string mstr;
             for (auto & pp : peers) {
                 NodePeer & peer2 = *pp.second;
                 if (peer2.voting_rights && peer2.match_index >= new_commit) {
+                    mstr += (peer2.name + ":" + std::to_string(peer2.match_index) + ";");
                     commit_vote++;
                 }
             }
@@ -1433,7 +1440,7 @@ NORMAL_TEST_COMMIT:
             // the servers..."
             if (enough_votes(commit_vote)) {
                 // if(!heartbeat) 
-                    debug_node("Advance commit_index from %lld to %lld with vote %d.\n", commit_index, new_commit, commit_vote);
+                    debug_node("Advance commit_index from %lld to %lld with vote %d. match_index {%s}.\n", commit_index, new_commit, commit_vote, mstr.c_str());
                 commit_index = new_commit;
                 // "When the entry has been safely replicated, the leader applies the entry to its state machine 
                 // and returns the result of that execution to the client."
@@ -1478,7 +1485,7 @@ CANT_COMMIT:
     //     return do_log(guard, log_string, x);
     // }
     template <typename F>
-    NuftResult do_log(std::lock_guard<std::mutex> & guard, ::raft_messages::LogEntry entry, F f, int command = 0){
+    NuftResult do_log(std::lock_guard<std::mutex> & guard, ::raft_messages::LogEntry entry, F f, int command){
         if(state != NodeState::Leader){
             // No, I am not the Leader, so please find the Leader first of all.
             debug_node("Not Leader!!!!!\n");
@@ -1505,10 +1512,10 @@ CANT_COMMIT:
     NuftResult do_log(std::lock_guard<std::mutex> & guard, const std::string & log_string, F f){
         ::raft_messages::LogEntry entry;
         entry.set_data(log_string);
-        return do_log(guard, entry, f);
+        return do_log(guard, entry, f, NUFT_CMD_NORMAL);
     }
     // For API usage
-    NuftResult do_log(::raft_messages::LogEntry entry, int command = 0){
+    NuftResult do_log(::raft_messages::LogEntry entry, int command){
         GUARD
         return do_log(guard, entry, [](RaftNode *){}, command);
     }
@@ -1517,7 +1524,7 @@ CANT_COMMIT:
         return do_log(guard, log_string, [](RaftNode *){});
     }
     template <typename F>
-    NuftResult do_log(::raft_messages::LogEntry entry, F f, int command = 0){
+    NuftResult do_log(::raft_messages::LogEntry entry, F f, int command){
         GUARD
         return do_log(guard, entry, f, command);
     }
@@ -1628,14 +1635,18 @@ CANT_COMMIT:
         trans_conf->index2 = entry.index();
         for(auto p: trans_conf->rem){
             // NOTICE When we remove Leader, we can no longer receive message from Leader, this will lead to a election.
-            // TODO In this case we can't remove Leader now.
+            // We can't remove Leader when:
             // "In this case, the leader steps
             //  down (returns to follower state) once it has committed the
             //  Cnew log entry. This means that there will be a period of
             //  time (while it is committingCnew) when the leader is managing a cluster that does not include itself; it replicates log
             //  entries but does not count itself in majorities."
-            debug_node("Remove peer %s.\n", p.c_str());
-            remove_peer(guard, p);
+            if(p == leader_name){
+                debug_node("Can't remove peer %s NOW because it is Leader.\n", p.c_str());
+            }else{
+                debug_node("Remove peer %s.\n", p.c_str());
+                remove_peer(guard, p);
+            }
         }
         persister->Dump();
     }
@@ -1643,25 +1654,18 @@ CANT_COMMIT:
     void update_configuration_finish(std::lock_guard<std::mutex> & guard){
         // If the Leader is not in C_{new},
         // It should yield its Leadership and step down,
-        // As soon as C_{new} is committed
-        debug_node("Switch successfully to new consensus. Node state %d\n", this->state);
+        // As soon as C_{new} is committed.
+        debug_node("Leader Switch successfully to new consensus. From state %d\n", this->state);
         for(auto p: trans_conf->rem){
             debug_node("Remove %s.\n", p.c_str());
             remove_peer(guard, p);
         }
         trans_conf->state = Configuration::State::NEW;
         // Make sure Leader leaves after new configuration committed.
-        if(Nuke::contains(trans_conf->rem, name)){
-            debug_node("Leader is not in C_{new}, step down and stop.\n");
-            become_follower(current_term);
-            // We can only notify here.
-            invoke_callback(NUFT_CB_CONF_END, {this, this->state});
-            stop(guard);
-        }else{
-            invoke_callback(NUFT_CB_CONF_END, {this, this->state});
-        }
+        invoke_callback(NUFT_CB_CONF_END, {this, this->state});
         delete trans_conf;
         trans_conf = nullptr;
+        // NOTICE Please Make sure new conf is committed on other nodes, then remove Leader!
         debug_node("Leader finish updating config.\n");
         persister->Dump();
     }
@@ -1676,19 +1680,32 @@ CANT_COMMIT:
             return;
         }
         trans_conf->state = Configuration::State::NEW;
-        if(Nuke::contains(trans_conf->rem, name)){
-            debug_node("I am not in C_{new}, stop.\n");
-            become_follower(current_term);
-            // We can only notify here.
-            invoke_callback(NUFT_CB_CONF_END, {this, this->state});
-            stop(guard);
-        }else{
-            invoke_callback(NUFT_CB_CONF_END, {this, this->state});
+        if(Nuke::contains(trans_conf->rem, leader_name)){
+            debug_node("Remove Leader %s NOW.\n", leader_name.c_str());
+            remove_peer(guard, leader_name);
         }
+        invoke_callback(NUFT_CB_CONF_END, {this, this->state});
         delete trans_conf;
         trans_conf = nullptr;
         debug_node("Follower finish updating config.\n");
         persister->Dump();
+    }
+
+    void safe_leave(std::lock_guard<std::mutex> & guard){
+        // Remove Leader safely when new conf is committed on peer.
+        // Remove Peer safely 
+        if(state == NodeState::Leader){
+            debug_node("Leader is not in C_{new}, step down and stop.\n");
+        }else{
+            debug_node("I am not in C_{new}, stop.\n");
+        }
+        become_follower(current_term);
+        stop(guard);
+    }
+
+    void safe_leave(){
+        GUARD
+        safe_leave(guard);
     }
 
     RaftNode(const std::string & addr) : state(NodeState::NotRunning), name(addr) {
@@ -1721,7 +1738,7 @@ CANT_COMMIT:
                     return;
                 }
                 this->on_timer();
-                std::this_thread::sleep_for(30ms);
+                std::this_thread::sleep_for(std::chrono::duration<int, std::milli> {default_heartbeat_interval});
             }
         });
     }

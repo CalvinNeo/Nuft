@@ -28,6 +28,7 @@ Run all tests by
 7. `NuftResult RaftNode::do_install_snapshot(IndexID last_included_index, const std::string & state_machine_state)`
 8. `NuftResult RaftNode::update_configuration(const std::vector<std::string> & app, const std::vector<std::string> & rem)`
 9. `std::string RaftNode::get_leader_name() const`
+10. `void safe_leave()`
 
 ## Callbacks
 

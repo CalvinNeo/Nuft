@@ -327,6 +327,7 @@ void StopMonitorApplied(RaftNode * ob){
 }
 
 int RegisterLog(std::lock_guard<std::mutex> & guard, const std::string & s, RaftNode * leader, int log_id, int tid = 0){
+    printf("GTEST: RegisterLog at %d\n", log_id);
     logs[log_id] = LogMon{s, false, tid};
     return log_id;
 }
@@ -675,6 +676,8 @@ TEST(Commit, LeaderChange){
     using namespace std::chrono_literals;
     std::this_thread::sleep_for(1s);
     int l1 = PickIndex({RN::Leader});
+    // NOTICE A test in delayed_start_election.log shows a node(name 7104) can start very late and miss the election.
+    // And GRPC error 14 may happen. This may due to a strange GRPC problem.
     ASSERT_NE(l1, -1);
     
     // (a)
@@ -708,7 +711,7 @@ TEST(Commit, LeaderChange){
     // S2's wrong entry (term 2, index 2) was not removed before we DisableSend from l2 to l1+1.
     DisconnectAfterReplicateTo(nodes[l2], "3", {});
     print_state();
-    if(l2 == l1 + 1){
+    if(l2 % n == (l1 + 1) % n){
         ASSERT_EQ(CheckCommit(2, "3"), 0);
     }else{
         // nodes[l1+1]'s log entry "2" is overwritten by nodes[l2]
@@ -757,6 +760,7 @@ TEST(Config, DelPeer){
     ASSERT_NE(victim, leader);
     leader->update_configuration({}, {victim->name});
     WaitConfig(leader, NUFT_CB_CONF_END, {RN::Leader});
+    victim->safe_leave();
     DisableNode(victim);
     RaftNode * ob = PickNode({RN::Follower});
     ASSERT_EQ(ob->peers.size(), 1);
@@ -780,8 +784,13 @@ TEST(Config, DelLeader){
     printf("GTEST: Start conf.\n");
     leader->update_configuration({}, {leader->name});
     printf("GTEST: Now wait leader finish conf trans.\n");
-    WaitConfig(leader, NUFT_CB_CONF_END, {RN::Leader, RN::Follower});
+    // NOTICE According to the Raft Paper, If we remove Leader from cluster,
+    // We can only remove it when the new conf is committed.
+    // Otherwise, A common consequence is a newly elected Leader can't commit the new conf,
+    // Because it is created by a previous Leader. And we wait here.
+    WaitConfig(ob, NUFT_CB_CONF_END, {RN::Follower});
     printf("GTEST: Now switched to new conf.\n");
+    leader->safe_leave();
     print_state();
     ASSERT_EQ(ob->peers.size(), 1);
     WaitElection(ob);
@@ -847,7 +856,7 @@ TEST(Persist, CrashAll){
 
     int ln = 4;
     for(int i = 0; i < ln; i++){
-        std::string logstr = std::string("log")+std::to_string(i);
+        std::string logstr = std::string("log") + std::to_string(i);
         leader->do_log(logstr);
         std::this_thread::sleep_for(1s);
         int support = CheckCommit(i, logstr);
@@ -935,9 +944,21 @@ TEST(Persist, FrequentCrash){
     int tot = 100;
     int crash_interval = 30;
     for(int i = 0; i < tot; i++){
-        leader->do_log(std::to_string(i) + ";");
+        printf("GTEST: Do logs[%d]\n", i);
+        int retry = 0;
+        while((!leader) || leader->do_log(std::to_string(i) + ";") < 0){
+            std::this_thread::sleep_for(TimeEnsureSuccessfulElection());
+            leader = PickNode({RN::Leader});
+            ASSERT_LT(retry, 3);
+        }
         if(i % crash_interval == 1){
+            // NOTICE In a early version, the client blocks here,
+            // Because the client called `leader->do_log` when leader is no longer the Leader.
+            // So these entries has gone missing.
+            // Ref persist.frequent.log
+            printf("GTEST: Wait Applied[%d]\n", i);
             WaitApplied(leader, i);
+            printf("GTEST: Wait Applied[%d] Finish\n", i);
             for(auto nd: nodes) {
                 CrashNode(nd);
             }
@@ -946,11 +967,9 @@ TEST(Persist, FrequentCrash){
                 RecoverNode(nd);
             }
             print_state();
-            std::this_thread::sleep_for(TimeEnsureSuccessfulElection());
-            leader = PickNode({RN::Leader});
-            ASSERT_TRUE(leader != nullptr);
         }
     }
+    printf("GTEST: Whip\n");
     leader->do_log("Whip\n");
     std::this_thread::sleep_for(1s);
     ASSERT_EQ(leader->commit_index, tot);
@@ -1016,6 +1035,7 @@ void GenericTest(int tot = 100, int n = 5, int snap_interval = -1, bool test_los
         crash_nodes.insert(victim);
         CrashNode(victim);
     }
+    // NOTICE After that, Leader may crash or lost
     auto inner_loop = [&](){
         int tid = current_tid.fetch_add(1);
         for(int i = 0; i < tot; i++){
@@ -1025,7 +1045,9 @@ void GenericTest(int tot = 100, int n = 5, int snap_interval = -1, bool test_los
             // Then one of our nodes timeout and start an election.
             int retry = 0;
             while(!CountLeader() == 1){
-                std::this_thread::sleep_for(TimeEnsureElection());
+                // In some cases, `TimeEnsureElection` provides not enough time.
+                // ref lostandcrash_notenoughtime.log
+                std::this_thread::sleep_for(TimeEnsureSuccessfulElection());
                 retry++;
                 ASSERT_LT(retry, 4);
             }
@@ -1080,6 +1102,10 @@ void GenericTest(int tot = 100, int n = 5, int snap_interval = -1, bool test_los
     RaftNode * leader = PickNode({RN::Leader});
     // Prevent "can't commit logs replicated by previous Leaders".
     printf("GTEST: Whip at %d\n", tot * clients);
+    // NOTICE We `RegisterLog` the Whip entry is the `tot * clients`th entry,
+    // However, previous logs may not successfully applied due to Leader change.
+    // And we just assume they will be succefully added, that we `RegisterLog` at `do_log`,
+    // rathen than `MonitorApplied`. We gonna change it in a later version.
     RegisterLog("0=Whip", leader, tot * clients, 0);
     leader->do_log("0=Whip");
     correct_storage[0] += "0=Whip";

@@ -148,11 +148,11 @@ void RaftMessagesClientSync::AsyncAppendEntries(const AppendEntriesRequest& requ
     std::string peer_name = this->peer_name;
     auto strongThis = shared_from_this();
 #if !defined(_HIDE_GRPC_NOTICE)
-    if(task_queue->workload() == task_queue->capacity){
-        debug("GRPC: TaskQueue Full.\n");
-    }else{
-        debug("GRPC: TaskQueue Running %d Capacity %d Queue %d\n", task_queue->workload(), task_queue->capacity, task_queue->in_queue());
-    }
+    // if(task_queue->workload() == task_queue->capacity){
+    //     debug("GRPC: TaskQueue Full.\n");
+    // }else{
+    //     debug("GRPC: TaskQueue Running %d Capacity %d Queue %d\n", task_queue->workload(), task_queue->capacity, task_queue->in_queue());
+    // }
 #endif
     if(task_queue->in_queue() > task_queue->capacity * 10){
         debug("GRPC: Too much in TaskQueue: Running %d Capacity %d Queue %d.\n", task_queue->workload(), task_queue->capacity, task_queue->in_queue());
