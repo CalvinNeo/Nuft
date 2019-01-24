@@ -58,7 +58,7 @@ void Persister::Dump(bool backup_conf){
     record.SerializeToOstream(&fo);
     fo.close();
 }
-void Persister::Load(){
+void Persister::Load(std::lock_guard<std::mutex> & guard){
     std::fstream fo{(node->name + std::string(".persist")).c_str(), std::ios::binary | std::ios::in};
     raft_messages::PersistRecord record;
     record.ParseFromIstream(&fo);
@@ -73,10 +73,10 @@ void Persister::Load(){
         const raft_messages::ConfRecord & confrecord = record.conf_record();
         RaftNode::Configuration conf = RaftNode::Configuration::from_string(confrecord.peers());
         if(confrecord.state() == RaftNode::Configuration::State::BLANK){
-            node->reset_peers();
+            node->reset_peers(guard);
             for(int i = 0; i < conf.old.size(); i++){
                 if(conf.old[i] != node->name){
-                    node->add_peer(conf.old[i]);
+                    node->add_peer(guard, conf.old[i]);
                 }
             }
         }else{
@@ -85,8 +85,8 @@ void Persister::Load(){
             node->trans_conf->state = (RaftNode::Configuration::State)confrecord.state();
             node->trans_conf->index = confrecord.index();
             node->trans_conf->index2 = confrecord.index2();
-            node->reset_peers();
-            node->apply_conf(*node->trans_conf);
+            node->reset_peers(guard);
+            node->apply_conf(guard, *node->trans_conf);
         }
     }
     fo.close();

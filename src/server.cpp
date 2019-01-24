@@ -183,7 +183,7 @@ void RaftMessagesClientSync::AsyncAppendEntries(const AppendEntriesRequest& requ
             }
         } else {
             // #if !defined(_HIDE_GRPC_NOTICE)
-            if(!heartbeat) debug("GRPC error(RequestVote %s->%s) %d: %s\n", request.name().c_str(), peer_name.c_str(), status.error_code(), status.error_message().c_str());
+            if(!heartbeat) debug("GRPC error(AppendEntries %s->%s) %d: %s\n", request.name().c_str(), peer_name.c_str(), status.error_code(), status.error_message().c_str());
             // #endif
         }
     }

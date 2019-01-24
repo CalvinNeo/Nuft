@@ -69,7 +69,7 @@ typedef RaftMessagesClientSync RaftMessagesClient;
 struct Persister{
     struct RaftNode * node = nullptr;
     void Dump(bool backup_conf = false);
-    void Load();
+    void Load(std::lock_guard<std::mutex> &);
 };
 
 struct NodePeer {
@@ -281,7 +281,7 @@ struct RaftNode {
     RaftServerContext * raft_message_server = nullptr;
     std::thread timer_thread;
     uint64_t start_timepoint; // Reject RPC from previous test cases.
-    // Ref. 奇怪的erase详解.log
+    // Ref. elaborate_strange_erase.log
     uint64_t last_timepoint; // TODO Reject RPC from previous meeage from current Leader.
 
     // RPC utils for sync
@@ -517,7 +517,7 @@ VOTE_NOT_ENOUGH:
         }
     }
 
-    void run() {
+    void run(std::lock_guard<std::mutex> & guard) {
         debug_node("Run node. Switch state to Follower.\n");
         if (state != NodeState::NotRunning) {
             return;
@@ -528,10 +528,18 @@ VOTE_NOT_ENOUGH:
         persister->Dump(true);
         reset_election_timeout();
     }
-    void run(const std::string & new_name){
+    void run(){
+        GUARD
+        run(guard);
+    }
+    void run(std::lock_guard<std::mutex> & guard, const std::string & new_name){
         name = new_name;
-        persister->Load();
-        run();
+        persister->Load(guard);
+        run(guard);
+    }
+    void run(const std::string & new_name){
+        GUARD
+        run(guard, new_name);
     }
     void apply_conf(std::lock_guard<std::mutex> & guard, const Configuration & conf){
         debug_node("Apply conf: old %u, app %u, rem %u\n", conf.old.size(), conf.app.size(), conf.rem.size());
@@ -904,7 +912,8 @@ end:
 
         uint64_t current_ms = get_current_ms();
         election_fail_timeout_due = current_ms + default_election_fail_timeout_interval;
-        debug_node("Lost Leader of (%s). Start election term: %lu, will timeout in %llu ms.\n", leader_name.c_str(), current_term, default_election_fail_timeout_interval);
+        debug_node("Lost Leader of (%s). Start election term: %lu, will timeout in %llu ms. My last_log_index = %lld\n", 
+            leader_name.c_str(), current_term, default_election_fail_timeout_interval, last_log_index());
         leader_name = "";
         // Same reason for setting `elect_timeout_due`. Ref. `reset_election_timeout`
         elect_timeout_due = UINT64_MAX;
@@ -948,7 +957,8 @@ end:
 
         if (request.term() > current_term) {
             // An election is ongoing. 
-            debug_node("Become Follower: Receive RequestVoteRequest from %s with new term of %llu, me %llu.\n", request.name().c_str(), request.term(), current_term);
+            debug_node("Become Follower: Receive RequestVoteRequest from %s with new term of %llu, me %llu. My last_log_index %lld, peer %lld\n", 
+                request.name().c_str(), request.term(), current_term, last_log_index(), last_log_term());
             // We can't set `vote_for` to none here, or will cause multiple Leader elected(ref strange_failure3.log)
             // TODO An optimation from the Raft Paper Chapter 7 Issue 3: 
             // "removed servers can disrupt the cluster. These servers will not receive heartbeats, so they will time out and start new elections.
@@ -970,11 +980,13 @@ end:
         }
 
         if (request.last_log_term() < last_log_term()) {
-            debug_node("Reject RequestVoteRequest because request.last_log_term() < last_log_term(): %llu < %llu.\n", request.last_log_term(), last_log_term());
+            debug_node("Reject RequestVoteRequest from %s because request.last_log_term() < last_log_term(): %llu < %llu.\n", 
+                request.name().c_str(), request.last_log_term(), last_log_term());
             goto end;
         }
         if (request.last_log_term() == last_log_term() && request.last_log_index() < last_log_index()) {
-            debug_node("Reject RequestVoteRequest because request.last_log_index() < last_log_index(): %llu < %llu.\n", request.last_log_index(), last_log_index());
+            debug_node("Reject RequestVoteRequest from %s because request.last_log_index() < last_log_index(): %llu < %llu.\n", 
+                request.name().c_str(), request.last_log_index(), last_log_index());
             goto end;
         }
 
@@ -1136,7 +1148,13 @@ end:
         }
         return true;
     }
-
+    std::string print_logs(){
+        std::string r;
+        for(int i = 0; i < logs.size(); i++){
+            r += std::to_string(logs[i].index()) + "(" + std::to_string(logs[i].term()) + ");";
+        }
+        return r;
+    }
     int on_append_entries_request(raft_messages::AppendEntriesResponse * response_ptr, const raft_messages::AppendEntriesRequest & request) {
         // When a Follower/Candidate receive `AppendEntriesResponse` from Leader,
         // Try append entries, then return a `AppendEntriesResponse`.
@@ -1159,7 +1177,7 @@ end:
         if(!Nuke::contains(peers, peer_name)){
             // NOTICE Must double check here.
             // Otherwise, a deferred `on_append_entries_request` may not have seen that
-            // we removed Leader. See "非常奇怪的Erase.log"
+            // we removed Leader. See wierd_erase.log
             debug_node("Ignore AppendEntriesRequest from %s. I don't have this peer.\n", request.name().c_str());
             return -1;
         }
@@ -1218,8 +1236,10 @@ DO_ERASE:
         if(request.prev_log_index() >= get_base_index()){
             // Reserve logs range (, request.prev_log_index()]
             if(request.prev_log_index() + 1 <= last_log_index()){
-                // TODO There is a very strange situation where `on_update_configuration_joint` is called IMMEDIATELY before Erase. I don't know why is it happen.
-                debug_node("Erase [%lld, ), last_log_index %lld, prev_log_index %lld\n", request.prev_log_index() + 1, last_log_index(), request.prev_log_index());
+                // NOTICE There is a situation where `on_update_configuration_joint` is called IMMEDIATELY before Erase. 
+                // This is because I mixed up some `NUFT_CMD_*`s in some early version.
+                debug_node("Erase [%lld, ). Before, last_log_index %lld, on Leader's side, prev_log_index %lld. logs = %s\n", 
+                    request.prev_log_index() + 1, last_log_index(), request.prev_log_index(), print_logs().c_str());
                 logs.erase(logs.begin() + request.prev_log_index() + 1 - get_base_index(), logs.end());
                 debug_node("Insert size %u\n", request.entries_size());
             }
@@ -1234,6 +1254,7 @@ DO_ERASE:
             // assert(request.leader_commit() <= last_log_index());
             commit_index = std::min(request.leader_commit(), last_log_index());
             debug_node("Leader %s ask me to advance commit_index to %lld.\n", request.name().c_str(), commit_index);
+            do_apply(guard);
         }else{
             if(request.entries_size()){
                 debug_node("My commit_index remain %lld, because it's GE than Leader's commit %lld, entries_size = %u. last_log_index = %lld\n", 

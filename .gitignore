@@ -48,3 +48,4 @@ tags
 *.pyc
 *.err
 *.persist
+read_persist

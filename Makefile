@@ -64,11 +64,15 @@ $(OBJ_ROOT):
 debug:
 	export GRPC_TRACE=all
 
+read_persist: $(GRPCOBJS)
+	$(CXX) $(GRPCOBJS) $(CFLAGS) $(LDFLAGS) -Isrc/grpc $(SRCS) $(SRC_ROOT)/test/read_persist.cpp -o $(ROOT)/read_persist -lpthread /usr/local/lib/libgtest.a 
+
 .PHONY: clean
 clean: clc
 	rm -rf $(BIN_ROOT)
 	rm -f core
 	rm -rf ./test
+	rm -rf ./read_persist
 
 .PHONY: clc
 clc:

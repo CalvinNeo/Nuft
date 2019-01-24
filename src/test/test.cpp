@@ -183,19 +183,24 @@ void RecoverNode(RaftNode * victim){
 }
 
 template <typename F>
-void WaitAny(RaftNode * ob, int ev, F f){
+void WaitAny(RaftNode * ob, int ev, F f, uint64_t timeout = 0){
     std::mutex mut;
     std::condition_variable cv;
 
-    ob->callbacks[ev] = [&mut, &cv, &f](int type, NuftCallbackArg * arg) -> int{
+    auto cb = [&mut, &cv, &f](int type, NuftCallbackArg * arg) -> int{
         if(f(type, arg)){
             std::unique_lock<std::mutex> lk(mut);
             cv.notify_one();
         }
         return 0;
     };
+    ob->callbacks[ev] = cb;
     std::unique_lock<std::mutex> lk(mut);
-    cv.wait(lk);
+    if(timeout){
+        cv.wait_for(lk, std::chrono::duration<int, std::milli> {timeout});
+    }else{
+        cv.wait(lk);
+    }
     ob->callbacks[ev] = nullptr;
 }
  
@@ -293,16 +298,34 @@ int CheckLog(IndexID index, const std::string & value){
 }
 
 void WaitApplied(RaftNode * ob, IndexID index){
+    printf("GTEST: Wait Applied[%d] at %s\n", index, ob->name.c_str());
     if(ob->last_applied >= index){
+        printf("GTEST: May already applied. ob->last_applied %lld >= index %lld\n", ob->last_applied, index);
         return;
     }
-    WaitAny(ob, NUFT_CB_ON_APPLY, [&](int type, NuftCallbackArg * arg){
-        ApplyMessage * applymsg = (ApplyMessage *)(arg->p1);
-        if(applymsg->index >= index){
-            return 1;
+    // NOTICE Applied operation may happen exactly HERE before we setup a hook.
+    // If no entries are add later(such as test Persist.FrequentLost whcih demands entries applied one by one),
+    // WaitAny will block forever. See persist.frequentcrash.log. So we add a timeout to WaitAny here.
+    // TODO Now there is a slight chance of SEGEV, see persist.frequentcrash.core2.log
+    while(1){
+        auto cbb = [&](int type, NuftCallbackArg * arg){
+            ApplyMessage * applymsg = (ApplyMessage *)(arg->p1);
+            if(applymsg->index >= index){
+                printf("GTEST: Applied! %lld %lld\n", applymsg->index, index);
+                return 1;
+            }
+            printf("GTEST: Not enough. applymsg->index %lld < index %lld\n", applymsg->index, index);
+            return 0;
+        };
+        WaitAny(ob, NUFT_CB_ON_APPLY, cbb, 1000);
+        if(ob->last_applied >= index){
+            // printf("GTEST: Oops! Maybe we set up a hook too slowly at %lld!\n", index);
+            break;
+        }else{
+            printf("GTEST: WaitApplied Timeout! Retry\n");
         }
-        return 0;
-    });
+    }
+    printf("GTEST: Wait Applied[%d] Finish at %s\n", index, ob->name.c_str());
 }
 
 template <typename F>
@@ -311,14 +334,7 @@ void MonitorApplied(RaftNode * ob, F f){
     ob->callbacks[NUFT_CB_ON_APPLY] = [f](int type, NuftCallbackArg * arg) -> int{
         std::lock_guard<std::mutex> guard((monitor_mut));
         ApplyMessage * applymsg = (ApplyMessage *)(arg->p1);
-        assert(logs.find(applymsg->index) != logs.end());
-        if(!logs[applymsg->index].applied){
-            // NOTICE Must first set `applied`, because `f` will check if `applied == true` when doing snapshot.
-            logs[applymsg->index].applied = true;
-            f(arg, applymsg);
-        }else{
-            printf("GTEST: Monitor APPLIED %d\n", applymsg->index);
-        }
+        f(arg, applymsg, guard);
         return NUFT_OK;
     };
 }
@@ -691,6 +707,8 @@ TEST(Commit, LeaderChange){
     DisconnectAfterReplicateTo(nodes[l1], "2", {l1+1});
     printf("GTEST: Crash\n");
     // Note leader is crashed now, we don't count its vote in `CheckLog` abd `CheckCommit`.
+    // NOTICE TODO There are some Failuers(logged in leaderchangestrangeblock.log and leaderchange7104delay.log) here, shows l1 replicate entry "2" to l1+1,
+    // But l1+1 doesn't respond from about 200ms(log shows no `on_append_entries_request` is handled).
     print_state();
     ASSERT_EQ(CheckCommit(0, "1"), 4);
     ASSERT_EQ(CheckCommit(1, "2"), 0);
@@ -946,19 +964,17 @@ TEST(Persist, FrequentCrash){
     for(int i = 0; i < tot; i++){
         printf("GTEST: Do logs[%d]\n", i);
         int retry = 0;
+        // NOTICE In a early version, the client blocks here,
+        // Because the client called `leader->do_log` when leader is no longer the Leader.
+        // So these entries has gone missing. Ref persist.frequent.log
         while((!leader) || leader->do_log(std::to_string(i) + ";") < 0){
             std::this_thread::sleep_for(TimeEnsureSuccessfulElection());
             leader = PickNode({RN::Leader});
             ASSERT_LT(retry, 3);
         }
+        // We appen and apply one-by-one, in case somw entries are overwirtten.
+        WaitApplied(leader, i);
         if(i % crash_interval == 1){
-            // NOTICE In a early version, the client blocks here,
-            // Because the client called `leader->do_log` when leader is no longer the Leader.
-            // So these entries has gone missing.
-            // Ref persist.frequent.log
-            printf("GTEST: Wait Applied[%d]\n", i);
-            WaitApplied(leader, i);
-            printf("GTEST: Wait Applied[%d] Finish\n", i);
             for(auto nd: nodes) {
                 CrashNode(nd);
             }
@@ -995,7 +1011,8 @@ void GenericTest(int tot = 100, int n = 5, int snap_interval = -1, bool test_los
     current_tid.store(0);
 
     for(auto nd: nodes){
-        MonitorApplied(nd, [snap_interval](NuftCallbackArg * arg, ApplyMessage * applymsg){
+        MonitorApplied(nd, [snap_interval](NuftCallbackArg * arg, ApplyMessage * applymsg, std::lock_guard<std::mutex> & guard){
+            RaftNode * nd = arg->node;
             IndexID index = applymsg->index;
             if(applymsg->from_snapshot){
                 printf("GTEST: Apply snapshot logs[%d] = '%s'\n", index, applymsg->data.c_str());
@@ -1003,22 +1020,34 @@ void GenericTest(int tot = 100, int n = 5, int snap_interval = -1, bool test_los
             }else{
                 printf("GTEST: Apply logs[%d] = '%s'\n", index, applymsg->data.c_str());
                 std::vector<std::string> l = Nuke::split(applymsg->data, "=");
+
                 int tid = atoi(l[0].c_str());
-                if(!Nuke::contains(storage, tid)){
-                    storage[tid] = "";
+
+                if(logs.find(index) != logs.end()){
+                    // If this entry is already applied, they must identical.
+                    printf("GTEST: Repeated apply at %lld.\n", index);
+                    ASSERT_EQ(logs[index].data, applymsg->data);
+                }else{
+                    RegisterLog(guard, applymsg->data, nd, index, tid);
+                    if(!Nuke::contains(correct_storage, tid)){
+                        correct_storage[tid] = "";
+                    }
+                    correct_storage[tid] += applymsg->data;
+                    if(!Nuke::contains(storage, tid)){
+                        storage[tid] = "";
+                    }
+                    storage[tid] += applymsg->data;
+                    printf("GTEST: storage = '%s'\n", storage[tid].c_str());
                 }
-                storage[tid] += applymsg->data;
-                if(logs[index].data != applymsg->data){
-                    printf("GTEST: logs[%d].data != applymsg->data\n", index);
-                }
-                ASSERT_EQ(logs[index].data, applymsg->data);
-                printf("GTEST: storage = '%s'\n", storage[tid].c_str());
+                // TODO Check if we apply in order(one-by-one)
+
+                logs[index].applied = true;
+
                 if(snap_interval > 0 && index % snap_interval == snap_interval - 1){
                     // Move to MonitorApply, Under protection from `monitor_mut`.
                     // NOTICE deadlock may happend here, because `do_apply` may hold lock.
                     printf("GTEST: APPLIED of %d is %d. Now do snapshot\n", index, logs[index].applied);
                     print_state();
-                    ASSERT_EQ(logs[index].applied, true);
                     arg->node->do_install_snapshot_unguard(index, storage[tid]);
                 }
             }
@@ -1056,15 +1085,13 @@ void GenericTest(int tot = 100, int n = 5, int snap_interval = -1, bool test_los
             // Otherwise there's a slight chance that RaftNode will apply before we RegisterLog. 
             int log_id;
             while(1){
-                auto cb = [&](RaftNode * nd) -> int{
-                    // TODO NOTICE Can't move `do_log` into `RegisterLog`, Otherwise can cause deadlock.
-                    IndexID last_log_index = nd->last_log_index();
-                    assert(nd->logs.back().data() == s);
-                    RegisterLog(s, nd, last_log_index, tid);
-                    return 0;
-                };
+                // NOTICE We can't RegisterLog here! We must Register them when applied.
+                // In a earlier version We `RegisterLog` the Whip entry is the `tot * clients`th entry,
+                // However, previous logs may not successfully applied due to Leader change.
+                // And we just assume they will be succefully added, that we `RegisterLog` at `do_log`,
+                // rathen than `MonitorApplied`. 
                 if(leader){
-                    log_id = leader->do_log(s, cb);
+                    log_id = leader->do_log(s);
                 }
                 if(log_id < 0){
                     printf("GTEST: Do Log Error %d\n", log_id);
@@ -1075,12 +1102,6 @@ void GenericTest(int tot = 100, int n = 5, int snap_interval = -1, bool test_los
                 }
             }
             printf("GTEST: Do logs[%d] from thread %d = '%s'\n", log_id, tid, s.c_str());
-            assert(logs.find(log_id) != logs.end());
-            // printf("GTEST: Do Log %d Finish\n", i);
-            if(!Nuke::contains(correct_storage, tid)){
-                correct_storage[tid] = "";
-            }
-            correct_storage[tid] += s;
         }
     };
 
@@ -1097,19 +1118,15 @@ void GenericTest(int tot = 100, int n = 5, int snap_interval = -1, bool test_los
     }
     printf("GTEST: Thread Finished.\n");
     print_state();
-    // Give enought time.
-    std::this_thread::sleep_for(TimeEnsureSuccessfulElection());
+    // Give enough time.
+    // Now we assert that all committed entries are applied, though some entries we append by `do_log` can gone missing.
+    std::this_thread::sleep_for(std::chrono::duration<int, std::milli>{10 * tot * clients});
     RaftNode * leader = PickNode({RN::Leader});
     // Prevent "can't commit logs replicated by previous Leaders".
-    printf("GTEST: Whip at %d\n", tot * clients);
-    // NOTICE We `RegisterLog` the Whip entry is the `tot * clients`th entry,
-    // However, previous logs may not successfully applied due to Leader change.
-    // And we just assume they will be succefully added, that we `RegisterLog` at `do_log`,
-    // rathen than `MonitorApplied`. We gonna change it in a later version.
-    RegisterLog("0=Whip", leader, tot * clients, 0);
-    leader->do_log("0=Whip");
-    correct_storage[0] += "0=Whip";
-    std::this_thread::sleep_for(std::chrono::duration<int, std::milli>{35 * tot * clients});
+    NuftResult whip_id = leader->do_log("0=Whip");
+    ASSERT_LE(whip_id, tot * clients);
+    printf("GTEST: Whip at %d\n", whip_id);
+    std::this_thread::sleep_for(std::chrono::duration<int, std::milli>{30 * tot * clients});
     delete [] ths;
     print_state();
     for(int i = 0; i < clients; i++){
@@ -1117,8 +1134,8 @@ void GenericTest(int tot = 100, int n = 5, int snap_interval = -1, bool test_los
     }
     leader = PickNode({RN::Leader});
     ASSERT_NE(leader, nullptr);
-    ASSERT_EQ(leader->commit_index, tot * clients);
-    ASSERT_EQ(leader->last_applied, tot * clients);
+    ASSERT_EQ(leader->commit_index, leader->last_applied);
+    ASSERT_LE(leader->commit_index, tot * clients);
     for(int i = 0; i < clients; i++){
         ASSERT_EQ(storage[i], correct_storage[i]);
     }
@@ -1136,6 +1153,8 @@ TEST(Snapshot, Basic){
 }
 
 TEST(Snapshot, Lost){
+    // snapshot.lost.fail.log elaborates how a reordered RPC call may lead to inconsistent,
+    // By erasing a committed entry
     GenericTest(100, 5, 30, true, false, 1);
 }
 
