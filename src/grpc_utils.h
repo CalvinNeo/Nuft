@@ -32,6 +32,7 @@
 #include "raft_messages.grpc.pb.h"
 #include "raft_messages.pb.h"
 #include "utils.h"
+#include "settings.h"
 
 using grpc::Server;
 using grpc::Channel;
@@ -70,6 +71,7 @@ struct RaftMessagesServiceImpl : public raft_messages::RaftMessages::Service {
 };
 
 
+#if defined(USE_GRPC_SYNC)
 struct RaftMessagesClientSync : std::enable_shared_from_this<RaftMessagesClientSync>{
     // `RaftMessagesClientSync` defines how to make a sync RPC call, and how to handle its results.
     using RequestVoteResponse = ::raft_messages::RequestVoteResponse;
@@ -98,7 +100,9 @@ private:
     std::unique_ptr<raft_messages::RaftMessages::Stub> stub;
 };
 
+#endif
 
+#if defined(USE_GRPC_ASYNC)
 
 struct RaftMessagesClientAsync {
     // `RaftMessagesClientAsync` defines how to make a async RPC call, and how to handle its results.
@@ -110,7 +114,7 @@ struct RaftMessagesClientAsync {
     using InstallSnapshotResponse = ::raft_messages::InstallSnapshotResponse;
 
     // Back reference to raft node.
-    struct RaftNode * raft_node = nullptr;
+    struct RaftNode * raft_node;
     std::string peer_name;
 
     struct AsyncClientCallBase {
@@ -126,29 +130,9 @@ struct RaftMessagesClientAsync {
         virtual ~AsyncClientCall() {}
     };
 
-    void AsyncRequestVote(const RequestVoteRequest& request)
-    {
-        // Call will be removed from CompletionQueue
-        AsyncClientCall<RequestVoteResponse> * call = new AsyncClientCall<RequestVoteResponse>();
-        call->type = 1;
-        call->response_reader = stub->AsyncRequestVote(&call->context, request, &cq);
-        call->response_reader->Finish(&call->response, &call->status, (void*)call);
-    }
-
-    void AsyncAppendEntries(const AppendEntriesRequest& request, bool heartbeat)
-    {
-        AsyncClientCall<AppendEntriesResponse> * call = new AsyncClientCall<AppendEntriesResponse>();
-        call->type = 2;
-        call->response_reader = stub->AsyncAppendEntries(&call->context, request, &cq);
-        call->response_reader->Finish(&call->response, &call->status, (void*)call);
-    }
-
-    void AsyncInstallSnapshot(const InstallSnapshotRequest& request){
-        AsyncClientCall<InstallSnapshotResponse> * call = new AsyncClientCall<InstallSnapshotResponse>();
-        call->type = 3;
-        call->response_reader = stub->AsyncInstallSnapshot(&call->context, request, &cq);
-        call->response_reader->Finish(&call->response, &call->status, (void*)call);
-    }
+    void AsyncRequestVote(const RequestVoteRequest& request);
+    void AsyncAppendEntries(const AppendEntriesRequest& request, bool heartbeat);
+    void AsyncInstallSnapshot(const InstallSnapshotRequest& request);
 
     void AsyncCompleteRpc();
 
@@ -163,7 +147,7 @@ private:
     CompletionQueue cq;
     std::thread cq_thread;
 };
-
+#endif
 
 struct RaftServerContext{
     RaftMessagesServiceImpl * service;
@@ -172,4 +156,31 @@ struct RaftServerContext{
     RaftServerContext(struct RaftNode * node);
     std::thread wait_thread;
     ~RaftServerContext();
+};
+
+
+
+struct RaftMessagesStreamServiceImpl : public raft_messages::RaftStreamMessages::Service {
+    // `RaftMessagesServiceImpl` defines what we do when receiving a RPC stream call.
+
+    using RequestVoteResponse = ::raft_messages::RequestVoteResponse;
+    using RequestVoteRequest = ::raft_messages::RequestVoteRequest;
+    using AppendEntriesRequest = ::raft_messages::AppendEntriesRequest;
+    using AppendEntriesResponse = ::raft_messages::AppendEntriesResponse;
+    using InstallSnapshotRequest = ::raft_messages::InstallSnapshotRequest;
+    using InstallSnapshotResponse = ::raft_messages::InstallSnapshotResponse;
+
+    struct RaftNode * raft_node = nullptr;
+
+    RaftMessagesStreamServiceImpl(struct RaftNode * _raft_node) : raft_node(_raft_node) {
+
+    }
+    ~RaftMessagesStreamServiceImpl(){
+        raft_node = nullptr;
+    }
+
+
+    Status RequestVote(ServerContext* context, ::grpc::ServerReaderWriter< ::raft_messages::RequestVoteResponse, RequestVoteRequest>* stream);
+    Status AppendEntries(ServerContext* context, ::grpc::ServerReaderWriter< ::raft_messages::AppendEntriesResponse, AppendEntriesRequest>* stream);
+    Status InstallSnapshot(ServerContext* context, ::grpc::ServerReaderWriter< ::raft_messages::InstallSnapshotResponse, InstallSnapshotRequest>* stream);
 };

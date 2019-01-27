@@ -85,3 +85,9 @@ service RaftMessages {
 	rpc AppendEntries (AppendEntriesRequest) returns (AppendEntriesResponse) {}
 	rpc InstallSnapshot (InstallSnapshotRequest) returns (InstallSnapshotResponse) {}
 }
+
+service RaftStreamMessages {
+	rpc RequestVote (stream RequestVoteRequest) returns (stream RequestVoteResponse) {}
+	rpc AppendEntries (stream AppendEntriesRequest) returns (stream AppendEntriesResponse) {}
+	rpc InstallSnapshot (stream InstallSnapshotRequest) returns (stream InstallSnapshotResponse) {}
+}

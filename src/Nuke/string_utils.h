@@ -21,7 +21,7 @@ inline int asprintf(char ** ptr, const char * fmt, ...) {
             // the string has been completely written.
             return n;
         }else{
-            delete *ptr;
+            delete [] *ptr;
             size *= 2;
             *ptr = new char[size];
         }

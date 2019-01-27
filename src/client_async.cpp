@@ -18,9 +18,12 @@
 *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
 **************************************************************************/
 
-#include "server.h"
+#include "grpc_utils.h"
 #include "node.h"
 #include <iostream>
+
+
+#if defined(USE_GRPC_ASYNC)
 
 void RaftMessagesClientAsync::AsyncCompleteRpc()
 {
@@ -59,7 +62,29 @@ void RaftMessagesClientAsync::AsyncCompleteRpc()
     }
 }
 
+void RaftMessagesClientAsync::AsyncRequestVote(const RequestVoteRequest& request)
+{
+    // Call will be removed from CompletionQueue
+    AsyncClientCall<RequestVoteResponse> * call = new AsyncClientCall<RequestVoteResponse>();
+    call->type = 1;
+    call->response_reader = stub->AsyncRequestVote(&call->context, request, &cq);
+    call->response_reader->Finish(&call->response, &call->status, (void*)call);
+}
 
+void RaftMessagesClientAsync::AsyncAppendEntries(const AppendEntriesRequest& request, bool heartbeat)
+{
+    AsyncClientCall<AppendEntriesResponse> * call = new AsyncClientCall<AppendEntriesResponse>();
+    call->type = 2;
+    call->response_reader = stub->AsyncAppendEntries(&call->context, request, &cq);
+    call->response_reader->Finish(&call->response, &call->status, (void*)call);
+}
+
+void RaftMessagesClientAsync::AsyncInstallSnapshot(const InstallSnapshotRequest& request){
+    AsyncClientCall<InstallSnapshotResponse> * call = new AsyncClientCall<InstallSnapshotResponse>();
+    call->type = 3;
+    call->response_reader = stub->AsyncInstallSnapshot(&call->context, request, &cq);
+    call->response_reader->Finish(&call->response, &call->status, (void*)call);
+}
 
 RaftMessagesClientAsync::RaftMessagesClientAsync(const char * addr, struct RaftNode * _raft_node) : raft_node(_raft_node), peer_name(addr) {
     std::shared_ptr<Channel> channel = grpc::CreateChannel(addr, grpc::InsecureChannelCredentials());
@@ -72,3 +97,5 @@ RaftMessagesClientAsync::RaftMessagesClientAsync(const char * addr, struct RaftN
 RaftMessagesClientAsync::RaftMessagesClientAsync(const std::string & addr, struct RaftNode * _raft_node) : RaftMessagesClientAsync(addr.c_str(), _raft_node) {
 
 }
+
+#endif

@@ -19,7 +19,7 @@
 **************************************************************************/
 
 #include "node.h"
-#include "server.h"
+#include "grpc_utils.h"
 #include <fstream>
 
 RaftNode * make_raft_node(const std::string & addr) {
@@ -27,9 +27,9 @@ RaftNode * make_raft_node(const std::string & addr) {
     return node;
 }
 
-void Persister::Dump(bool backup_conf){
+void Persister::Dump(std::lock_guard<std::mutex> & guard, bool backup_conf){
     // TODO maybe use SerializeToString is better.
-    if(!node->is_running()) return;
+    if(!node->is_running(guard)) return;
     std::fstream fo{(node->name + std::string(".persist")).c_str(), std::ios::binary | std::ios::out};
     raft_messages::PersistRecord record;
     record.set_term(node->current_term);
@@ -59,6 +59,7 @@ void Persister::Dump(bool backup_conf){
     fo.close();
 }
 void Persister::Load(std::lock_guard<std::mutex> & guard){
+    printf("PERSISTER: LOAD %s\n", node->name.c_str());
     std::fstream fo{(node->name + std::string(".persist")).c_str(), std::ios::binary | std::ios::in};
     raft_messages::PersistRecord record;
     record.ParseFromIstream(&fo);
