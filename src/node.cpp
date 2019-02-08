@@ -36,6 +36,8 @@ void Persister::Dump(std::lock_guard<std::mutex> & guard, bool backup_conf){
     // assert(node->current_term != 77777);
     record.set_name(node->name);
     record.set_vote_for(node->vote_for);
+    // seq.persist.crashall.fail.log shows we need to persist `last_seq`
+    record.set_last_seq(node->last_seq);
     for(int i = 0; i < node->logs.size(); i++){
         raft_messages::LogEntry & entry = *(record.add_entries());
         entry = node->logs[i];
@@ -67,6 +69,7 @@ void Persister::Load(std::lock_guard<std::mutex> & guard){
     node->name = record.name();
     node->vote_for = record.vote_for();
     node->logs.clear();
+    node->last_seq = record.last_seq();
     for(int i = 0; i < record.entries_size(); i++){
         node->logs.push_back(record.entries(i));
     }

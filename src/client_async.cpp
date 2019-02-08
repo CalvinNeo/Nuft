@@ -23,7 +23,7 @@
 #include <iostream>
 
 
-#if defined(USE_GRPC_ASYNC)
+#if defined(USE_GRPC_ASYNC) && !defined(USE_GRPC_STREAM)
 
 void RaftMessagesClientAsync::AsyncCompleteRpc()
 {

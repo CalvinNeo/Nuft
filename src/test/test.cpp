@@ -162,35 +162,42 @@ void EnableNode(RaftNode * victim){
 }
 
 void DisableSend(RaftNode * victim, std::vector<int> nds){
-    for(auto nd: nds){
+    for(int i: nds){
+        RaftNode * nd = nodes[i];
         if(nd != victim){
-            victim->disable_send(nodes[nd%nodes.size()]->name);
+            victim->disable_send(nodes[i%nodes.size()]->name);
         }
     }
 }
 void EnableSend(RaftNode * victim, std::vector<int> nds){
-    for(auto nd: nds){
+    for(int i: nds){
+        RaftNode * nd = nodes[i];
         if(nd != victim){
-            victim->enable_send(nodes[nd%nodes.size()]->name);
+            victim->enable_send(nodes[i%nodes.size()]->name);
         }
     }
 }
 void DisableReceive(RaftNode * victim, std::vector<int> nds){
-    for(auto nd: nds){
+    for(int i: nds){
+        RaftNode * nd = nodes[i];
         if(nd != victim){
-            victim->disable_receive(nodes[nd%nodes.size()]->name);
+            victim->disable_receive(nodes[i%nodes.size()]->name);
         }
     }
 }
 void EnableReceive(RaftNode * victim, std::vector<int> nds){
-    for(auto nd: nds){
+    for(int i: nds){
+        RaftNode * nd = nodes[i];
         if(nd != victim){
-            victim->enable_receive(nodes[nd%nodes.size()]->name);
+            victim->enable_receive(nodes[i%nodes.size()]->name);
         }
     }
 }
 
 void CrashNode(RaftNode * victim, std::lock_guard<std::mutex> & guard){
+    // NOTICE `CrashNode` is guarded, so we must handle with later arrived RPCs carefully, 
+    // To avoid a complicated deadlock, See client_stream_sync.cpp:RaftMessagesStreamClientSync::handle_response():t2
+    // See stream.CrashNode.block.log
     printf("GTEST: Crash Node %s\n", victim->name.c_str());
     DisableNode(victim, guard);
     victim->logs.clear();
@@ -446,6 +453,8 @@ void DisconnectAfterReplicateTo(RaftNode * leader, const std::string & log_str, 
     DisableSend(leader, sset);
     leader->do_log(log_str);
     // Make sure already sent to sset
+    // NOTICE This time may not be enough, if RPC is delayed too much
+    // See seq.delayed.leaderchange.log
     std::this_thread::sleep_for(TimeEnsureNoElection());
     DisableNode(leader);
 }
@@ -494,6 +503,19 @@ TEST(Network, RedirectToLeader){
 OK:
     FreeRaftNodes();
     ((void)0);
+}
+
+TEST(Election, Basic){
+    int n = 3;
+    ASSERT_GT(n, 1);
+    MakeRaftNodes(n);
+    WaitElection(nodes[0]);
+    // It is important to wait for a while and let the election ends in all node.
+    using namespace std::chrono_literals;
+    std::this_thread::sleep_for(4s);
+    int leader_cnt = CountLeader();
+    ASSERT_EQ(leader_cnt, 1);
+    FreeRaftNodes();
 }
 
 TEST(Election, Normal){
@@ -667,15 +689,23 @@ TEST(Commit, LeaderLost){
     for(int i = 0; i < ln1; i++){
         std::string logstr = std::string("log")+std::to_string(i);
         leader->do_log(logstr);
-        std::this_thread::sleep_for(1s);
+        int retry = 0;
+        while(1){
+            std::this_thread::sleep_for(1s);
+            int support = CheckCommit(i, logstr);
+            int maj = MajorityCount(n);
+            if(support < maj){
+                // See Persist.CrashAll
+                printf("GTEST: retry %d, support %d < %d is not enough. logs[%d] is not committed. term %llu, original_term %llu\n", 
+                    retry, support, maj, i, leader->current_term, original_term);
+            }else{
+                printf("GTEST: support %d\n", support);
+                break;
+            }
+            retry++;
+            ASSERT_LT(retry, 4);
+        }
         int support = CheckCommit(i, logstr);
-        if(support != MajorityCount(n)){
-            // See Persist.CrashAll
-            printf("GTEST: support %d is not enough. logs[%d] is not committed. term %llu, original_term %llu\n", 
-                support, i, leader->current_term, original_term);
-        }else{
-            printf("GTEST: support %d\n", support);
-        };
         ASSERT_GE(support, MajorityCount(n));
     }
     ASSERT_EQ(leader->commit_index, ln1 - 1);
@@ -693,7 +723,7 @@ TEST(Commit, LeaderLost){
         new_leader->do_log(logstr);
         std::this_thread::sleep_for(1s);
         int support = CheckCommit(i, logstr);
-        if(support != MajorityCount(n)){
+        if(support < MajorityCount(n)){
             // See Persist.CrashAll
             printf("GTEST: support %d is not enough. logs[%d] is not committed. term %llu, original_term %llu\n", 
                 support, i, leader->current_term, original_term);
@@ -727,8 +757,11 @@ TEST(Commit, NetworkPartition){
     std::vector<int> p1 = {l1, (l1+1)%n};
     std::vector<int> p2 = {(l1+2)%n, (l1+3)%n, (l1+4)%n};
     NetworkPartition(p1, p2);
+    printf("GTEST: Do logs[2]\n");
     nodes[l1]->do_log("2");
-    std::this_thread::sleep_for(TimeEnsureNoElection());
+    // seq.networkpartition.checklog.log shows it is not enough
+    // std::this_thread::sleep_for(TimeEnsureNoElection());
+    std::this_thread::sleep_for(1s);
     ASSERT_EQ(CheckCommit(0, "1"), 5);
     ASSERT_EQ(CheckCommit(1, "2"), 0);
     ASSERT_EQ(CheckLog(1, "2"), 2);
@@ -746,7 +779,11 @@ TEST(Commit, NetworkPartition){
     }
     ASSERT_NE(l1%n, l2%n);
     nodes[l2]->do_log("3");
-    std::this_thread::sleep_for(1s);
+    int retry = 0;
+    while(nodes[l2]->commit_index != 1){
+        std::this_thread::sleep_for(1s);
+        ASSERT_LE(retry, 4);
+    }
     ASSERT_EQ(CheckCommit(1, "3"), -1);
     
     RecoverNetworkPartition(p1, p2);
@@ -792,7 +829,7 @@ TEST(Commit, LeaderChange){
     // Leader is crashed now, we don't count its vote in `CheckLog` abd `CheckCommit`.
     ASSERT_EQ(CheckCommit(0, "1"), 4);
     ASSERT_EQ(CheckCommit(1, "2"), 0);
-    // Only S2 has entry "2"
+    // Only S1 and S2 has entry "2", S1 is Crashed, so only S2 have entry "2"
     ASSERT_EQ(CheckLog(1, "2"), 1);
     ASSERT_EQ(nodes[l1]->commit_index, 0);
     
@@ -815,12 +852,6 @@ TEST(Commit, LeaderChange){
         // nodes[l1+1]'s log entry "2" is overwritten by nodes[l2]
         ASSERT_EQ(CheckCommit(1, "3"), 0);
     }
-//    printf("GTEST: Recover S5.\n");
-//    EnableNode(nodes[l2]);
-//    WaitElection(nodes[l2]);
-//    std::this_thread::sleep_for(1s);
-//    ASSERT_EQ(CheckCommit(1, "3"), 0);
-    // (c)
     FreeRaftNodes();
 }
 
@@ -986,9 +1017,10 @@ TEST(Persist, CrashAll){
         }
         print_state();
     }
-    leader->do_log("COMMIT");
+    printf("GTEST: Now Whip\n");
+    leader->do_log("Whip");
     std::this_thread::sleep_for(1s);
-    ASSERT_EQ(CheckCommit(ln, "COMMIT"), n);
+    ASSERT_EQ(CheckCommit(ln, "Whip"), n);
     FreeRaftNodes();
 }
 
@@ -1019,7 +1051,15 @@ TEST(Persist, AddPeer){
     RaftNode * nnd = AddRaftNode(new_port_base);
     leader->update_configuration({nnd->name}, {});
     printf("GTEST: Wait Config at %s.\n", nnd->name.c_str());
-    WaitAny(leader, NUFT_CB_CONF_START, [&](NUFT_CB_TYPE type, NuftCallbackArg * args){
+    // NOTICE Can't WaitAny with Leader.
+    // Leader may change to 7103 under the following situation, see stream.Persist.Addpeer.LeaderChanged.log
+    //               Name        State  Term  log size  commit lastapp   peers    run  trans
+    // 127.0.0.1:7100       Leader     2         2       0      -1       4      T      4
+    // 127.0.0.1:7101     Follower     2         1       0       0       4      T      2
+    // 127.0.0.1:7102     Follower     2         1      -1      -1       4      T      2
+    // 127.0.0.1:7103     Follower     2         1      -1      -1       4      T      2
+    // 127.0.0.1:7200     Follower     2         1      -1      -1       4      T      2
+    WaitAny(nnd, NUFT_CB_CONF_START, [&](NUFT_CB_TYPE type, NuftCallbackArg * args){
             if(args->a1 == RaftNode::Configuration::State::JOINT_NEW){
                 // Now joint consensus is committed
                 return 1;
@@ -1156,6 +1196,7 @@ void GenericTest(int tot = 100, int n = 5, int snap_interval = -1, bool test_los
         crash_nodes.insert(victim);
         CrashNode(victim);
     }
+    print_state();
     // NOTICE After that, Leader may crash or lost
     auto inner_loop = [&](){
         int tid = current_tid.fetch_add(1);
@@ -1245,8 +1286,13 @@ TEST(Snapshot, Basic){
 }
 
 TEST(Snapshot, Lost){
+    // NOTICE Important issue about reordered rpc.
     // snapshot.lost.fail.log elaborates how a reordered RPC call may lead to inconsistent,
-    // By erasing a committed entry
+    // By erasing a committed entry.
+    // NOTICE Someone says Raft requires ordered stream. See https://stackoverflow.com/questions/54310611/how-to-handle-reordered-rpc-in-raft
+    // NOTICE However, others think this is due to a misimplementation.
+    // See https://thesquareplanet.com/blog/raft-qa/
+    // NOTICE seq.concurrent.log shows even we refuse reordered RPC, errors can still happen.
     GenericTest(100, 5, 30, true, false, 1);
 }
 
@@ -1263,8 +1309,13 @@ TEST(Concurrent, LostAndCrash){
 }
 
 int main(int argc, char ** argv){
-    testing::InitGoogleTest(&argc, argv);
-    auto r = RUN_ALL_TESTS();
-    FreeRaftNodes();
-    return r;
+    std::future<int> future = std::async(std::launch::async, [&](){
+        testing::InitGoogleTest(&argc, argv);
+        auto r = RUN_ALL_TESTS();
+        FreeRaftNodes();
+        return r;
+    });
+    std::future_status status = future.wait_for(std::chrono::seconds(300));
+    assert(status == std::future_status::ready);
+    return future.get();
 }

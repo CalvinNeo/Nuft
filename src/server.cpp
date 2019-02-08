@@ -22,6 +22,13 @@
 #include "node.h"
 #include <iostream>
 
+using RequestVoteResponse = ::raft_messages::RequestVoteResponse;
+using RequestVoteRequest = ::raft_messages::RequestVoteRequest;
+using AppendEntriesRequest = ::raft_messages::AppendEntriesRequest;
+using AppendEntriesResponse = ::raft_messages::AppendEntriesResponse;
+using InstallSnapshotRequest = ::raft_messages::InstallSnapshotRequest;
+using InstallSnapshotResponse = ::raft_messages::InstallSnapshotResponse;
+    
 RaftServerContext::RaftServerContext(struct RaftNode * node){
     service = new RaftMessagesServiceImpl(node);
 #if !defined(_HIDE_GRPC_NOTICE)
@@ -31,11 +38,14 @@ RaftServerContext::RaftServerContext(struct RaftNode * node){
     builder->AddListeningPort(node->name, grpc::InsecureServerCredentials());
     builder->RegisterService(service);
     server = std::unique_ptr<Server>{builder->BuildAndStart()};
-    wait_thread = std::thread([&](){server->Wait();});
 }
 RaftServerContext::~RaftServerContext(){
     debug("Wait shutdown\n");
     server->Shutdown();
+    debug("Wait Join\n");
+    wait_thread = std::thread([&](){
+        server->Wait();
+    });
     wait_thread.join();
     debug("wait_thread Joined\n");
     delete service;
@@ -101,4 +111,133 @@ Status RaftMessagesServiceImpl::InstallSnapshot(ServerContext* context,
     }
 }
 
+Status RaftMessagesStreamServiceImpl::RequestVote(ServerContext* context, ::grpc::ServerReaderWriter< ::raft_messages::RequestVoteResponse, RequestVoteRequest>* stream){
+    while(!stop.load()){
+        while (1) {
+            RequestVoteRequest request;
+            RequestVoteResponse response;
+            // context->set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(100));
+            if(!stream->Read(&request)){
+                break;
+            }
+            if(stop.load()){
+                break;
+            }
+            assert(request.has_name());
+            #if !defined(_HIDE_GRPC_NOTICE)
+            debug("GRPC: Receive RequestVoteRequest from %s, me %s\n", request.name().c_str(), raft_node->name.c_str());
+            #endif
+            if(!raft_node){
+                // `raft_node` is cleared, 
+                debug("GRPC: Me %s shutdown\n", request.name().c_str(), raft_node->name.c_str());
+                return Status::OK;
+            }
+            // debug("GRPC: Handle RequestVoteRequest from %s, me %s\n", request.name().c_str(), raft_node->name.c_str());
+            int response0 = raft_node->on_vote_request(&response, request);
+            if(response0 == 0){
+                assert(response.has_name());
+                stream->Write(response);
+            }
+            // debug("GRPC: Finish RequestVoteRequest from %s, me %s\n", request.name().c_str(), raft_node->name.c_str());
+            #if !defined(_HIDE_GRPC_NOTICE)
+            debug("GRPC: Respond RequestVoteRequest from %s, me %s\n", request.name().c_str(), raft_node->name.c_str());
+            #endif
+        }
+    }
+    return Status::OK;
+}
+Status RaftMessagesStreamServiceImpl::AppendEntries(ServerContext* context, ::grpc::ServerReaderWriter< ::raft_messages::AppendEntriesResponse, AppendEntriesRequest>* stream){
+    while(!stop.load()){
+        while (1) {
+            AppendEntriesRequest request;
+            AppendEntriesResponse response;
+            // context->set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(100));
+            if(!stream->Read(&request)){
+                break;
+            }
+            if(stop.load()){
+                break;
+            }
+            assert(request.has_name());
+            #if !defined(_HIDE_GRPC_NOTICE)
+            debug("GRPC: Receive AppendEntriesRequest from %s, me %s\n", request.name().c_str(), raft_node->name.c_str());
+            #endif
+            if(!raft_node){
+                debug("GRPC: Me %s shutdown\n", request.name().c_str(), raft_node->name.c_str());
+                return Status::OK;
+            }
+            int response0 = raft_node->on_append_entries_request(&response, request);
+            if(response0 == 0){
+                assert(response.has_name());
+                stream->Write(response);
+            }
+            #if !defined(_HIDE_GRPC_NOTICE)
+            // debug("GRPC: Respond AppendEntriesRequest from %s, me %s\n", request.name().c_str(), raft_node->name.c_str());
+            #endif
+        }
+    }
+    return Status::OK;
+}
+Status RaftMessagesStreamServiceImpl::InstallSnapshot(ServerContext* context, ::grpc::ServerReaderWriter< ::raft_messages::InstallSnapshotResponse, InstallSnapshotRequest>* stream){
+    while(!stop.load()){
+        while (1) {
+            InstallSnapshotRequest request;
+            InstallSnapshotResponse response;
+            // context->set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(100));
+            if(!stream->Read(&request)){
+                break;
+            }
+            if(stop.load()){
+                break;
+            }
+            assert(request.has_name());
+            #if !defined(_HIDE_GRPC_NOTICE)
+            debug("GRPC: Receive InstallSnapshotRequest from %s, me %s\n", request.name().c_str(), raft_node->name.c_str());
+            #endif
+            if(!raft_node){
+                debug("GRPC: Me %s shutdown\n", request.name().c_str(), raft_node->name.c_str());
+                return Status::OK;
+            }
+            int response0 = raft_node->on_install_snapshot_request(&response, request);
+            if(response0 == 0){
+                assert(response.has_name());
+                stream->Write(response);
+            }
+            #if !defined(_HIDE_GRPC_NOTICE)
+            // debug("GRPC: Respond InstallSnapshotRequest from %s, me %s\n", request.name().c_str(), raft_node->name.c_str());
+            #endif
+        }
+    }
 
+    return Status::OK;
+}
+
+RaftStreamServerContext::RaftStreamServerContext(struct RaftNode * node){
+    service = std::make_shared<RaftMessagesStreamServiceImpl>(node);
+    // service = new RaftMessagesStreamServiceImpl(node);
+#if !defined(_HIDE_GRPC_NOTICE)
+    debug("GRPC: Listen to %s\n", node->name.c_str());
+#endif
+    builder = new ServerBuilder();
+    builder->AddListeningPort(node->name, grpc::InsecureServerCredentials());
+    builder->RegisterService(service.get());
+    // builder->RegisterService(service);
+    server = std::move(std::unique_ptr<Server>{builder->BuildAndStart()});
+}
+RaftStreamServerContext::~RaftStreamServerContext(){
+    service->stop.store(true);
+    wait_thread = std::thread([service=service, server=server](){
+        server->Wait();
+    });
+    debug("Wait shutdown\n");
+    // https://grpc.io/grpc/cpp/classgrpc_1_1_server_interface.html#a6a1d337270116c95f387e0abf01f6c6c
+    // In the case of the sync API, if the RPC function for a streaming call has already been started and takes a week to complete, 
+    // the RPC function won't be forcefully terminated
+    // server->Shutdown(std::chrono::system_clock::now() + std::chrono::milliseconds(100));
+    // server->Shutdown();
+    debug("Wait Join/Detach\n");
+    // NOTICE We can't join here
+    wait_thread.detach();
+    delete builder;
+    debug("wait_thread Joined/Detached\n");
+}

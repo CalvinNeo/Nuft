@@ -22,18 +22,7 @@
 #include "node.h"
 #include <iostream>
 
-#define MONITOR_DELAY_THRES 150
-
-inline bool monitor_delayed(uint64_t send_time){
-    uint64_t delta = get_current_ms() - send_time;
-    if(delta > MONITOR_DELAY_THRES){
-        printf("GRPC: Delayed gRPC Call for %llu ms!!\n", delta);
-        return true;
-    }
-    return false;
-}
-
-#if defined(USE_GRPC_SYNC)
+#if defined(USE_GRPC_SYNC) && !defined(USE_GRPC_STREAM)
 
 void RaftMessagesClientSync::AsyncRequestVote(const RequestVoteRequest& request)
 {
@@ -57,7 +46,7 @@ void RaftMessagesClientSync::AsyncRequestVote(const RequestVoteRequest& request)
             }
             // Test whether raft_node_>peers[peer_name] is destructed.
             if(Nuke::contains(strongThis->raft_node->peers, peer_name)){
-                if(request.time() < strongThis->raft_node->start_timepoint){
+                if(response.time() < strongThis->raft_node->start_timepoint){
                     debug("GRPC: Old message, Response from previous request REJECTED.\n");
                 }else{
                     monitor_delayed(request.time());
@@ -111,7 +100,7 @@ void RaftMessagesClientSync::AsyncAppendEntries(const AppendEntriesRequest& requ
                 return;
             }
             if(Nuke::contains(strongThis->raft_node->peers, peer_name)){
-                if(request.time() < strongThis->raft_node->start_timepoint){
+                if(response.time() < strongThis->raft_node->start_timepoint){
                     debug("GRPC: Old message, Response from previous request REJECTED.\n");
                 }else{
                     monitor_delayed(request.time());
@@ -151,7 +140,7 @@ void RaftMessagesClientSync::AsyncInstallSnapshot(const InstallSnapshotRequest& 
                 return;
             }
             if(Nuke::contains(strongThis->raft_node->peers, peer_name)){
-                if(request.time() < strongThis->raft_node->start_timepoint){
+                if(response.time() < strongThis->raft_node->start_timepoint){
                     debug("GRPC: Old message, Response from previous request REJECTED.\n");
                 }else{
                     monitor_delayed(request.time());

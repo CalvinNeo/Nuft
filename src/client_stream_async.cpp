@@ -18,24 +18,20 @@
 *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
 **************************************************************************/
 
-#pragma once
+#include "grpc_utils.h"
+#include "node.h"
+#include <iostream>
 
-// #define USE_GRPC_ASYNC
+using grpc::Channel;
+using grpc::ClientContext;
+using grpc::ClientReader;
+using grpc::ClientReaderWriter;
+using grpc::ClientWriter;
+using grpc::Status;
 
-#define USE_GRPC_SYNC
-// #define USE_GRPC_STREAM
-
-#if defined(USE_GRPC_ASYNC)
-#undef USE_GRPC_SYNC
-#define USE_GRPC_ASYNC
-#else
-// Use Sync gRPC model
-#undef USE_GRPC_ASYNC
-#define USE_GRPC_SYNC
-#endif
-
-#if defined(_HIDE_RAFT_DEBUG)
-#define debug_node(...)
-#else
-#define debug_node(...) NUKE_LOG(LOGLEVEL_DEBUG, RaftNodeLogger{this}, ##__VA_ARGS__)
-#endif
+using RequestVoteResponse = ::raft_messages::RequestVoteResponse;
+using RequestVoteRequest = ::raft_messages::RequestVoteRequest;
+using AppendEntriesRequest = ::raft_messages::AppendEntriesRequest;
+using AppendEntriesResponse = ::raft_messages::AppendEntriesResponse;
+using InstallSnapshotRequest = ::raft_messages::InstallSnapshotRequest;
+using InstallSnapshotResponse = ::raft_messages::InstallSnapshotResponse;

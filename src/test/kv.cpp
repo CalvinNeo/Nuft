@@ -1,20 +1,25 @@
 #include "node.h"
-#include "server.h"
 #include <vector>
 #include <unistd.h>
 #include <cstdlib>
 #include <signal.h>
 #include <cstdio>
+#include <map>
+#include <set>
 
 void sigint_handler(){
     fflush(stdout);
     fflush(stderr);
+    printf("Bye.\n");
     exit(0);
 }
 
 #define BUFFERSIZE 2048
 char buffer[BUFFERSIZE];
 char tmp[1024];
+
+std::map<std::string, int> int_data;
+
 int main(int argc, char *argv[]) {
     sigset(SIGINT, sigint_handler);
     sigset(SIGTERM, sigint_handler);
@@ -55,8 +60,20 @@ int main(int argc, char *argv[]) {
     }
     node->start();
     while(~scanf("%s", buffer)){
-        printf("===\n");
-        node->do_log(std::string(buffer));
+        std::string cmd = buffer;
+        if(cmd == "SET"){
+            scanf("%s", buffer);
+            std::string key = buffer;
+            scanf("%s", buffer);
+            std::string value = buffer;
+            WaitApplied(node, "");
+
+        }else if(cmd == "INCBY"){
+
+        }else if(cmd == "GET"){
+            scanf("%s", buffer);
+            std::string key = buffer;
+            node->do_log("");
+        }
     }
-    node->raft_message_server->server->Wait();
 }

@@ -7,7 +7,7 @@ cov_comp = -fprofile-arcs -ftest-coverage -fno-inline
 cov_lnk = -fprofile-arcs -ftest-coverage --coverage -fno-inline
 
 NO_WARN = -w
-TRIM_WARN = -Wno-unused-variable -Wno-unused-but-set-variable -Wformat-security
+TRIM_WARN = -Wno-unused-variable -Wno-unused-but-set-variable -Wno-format-security -Wformat=0
 GDB_INFO = -g
 SANA = -fsanitize=address
 SANT = -fsanitize=thread
@@ -21,8 +21,10 @@ LDFLAGS += -DGRPC_VERBOSITY=DEBUG -DGRPC_TRACE=all $(GRPC_PKGCONFIG) -Wl,--no-as
 endif
 
 LOG_LEVEL_NOTICE_MAJOR = -D_HIDE_HEARTBEAT_NOTICE -D_HIDE_GRPC_NOTICE -D_HIDE_NOEMPTY_REPEATED_APPENDENTRY_REQUEST
-LOG_LEVEL = -D_HIDE_HEARTBEAT_NOTICE -D_HIDE_NOEMPTY_REPEATED_APPENDENTRY_REQUEST -D_HIDE_GRPC_NOTICE 
+LOG_LEVEL = -D_HIDE_HEARTBEAT_NOTICE -D_HIDE_NOEMPTY_REPEATED_APPENDENTRY_REQUEST -D_HIDE_GRPC_NOTICE # -D_HIDE_RAFT_DEBUG
 CFLAGS += $(LOG_LEVEL)
+
+CFLAGS += $(TRIM_WARN)
 
 OBJ_EXT=o
 
@@ -43,6 +45,9 @@ all:
 
 test: $(GRPCOBJS)
 	$(CXX) $(GRPCOBJS) $(CFLAGS) $(LDFLAGS) -Isrc/grpc $(SRCS) $(SRC_ROOT)/test/test.cpp -o $(ROOT)/test -lpthread /usr/local/lib/libgtest.a 
+
+kv: $(GRPCOBJS)
+	$(CXX) $(GRPCOBJS) $(CFLAGS) $(LDFLAGS) -Isrc/grpc $(SRCS) $(SRC_ROOT)/test/kv.cpp -o $(ROOT)/kv -lpthread /usr/local/lib/libgtest.a 
 
 run_cluster:
 	python $(SRC_ROOT)/test/run_cluster.py
@@ -73,6 +78,7 @@ read_persist: $(GRPCOBJS)
 clean: clc
 	rm -rf $(BIN_ROOT)
 	rm -f core
+	rm -f ./kv
 	rm -rf ./test
 	rm -rf ./read_persist
 
