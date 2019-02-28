@@ -11,6 +11,8 @@ def main():
         # returncode = subprocess.call("./test --gtest_filter='Election.Normal'", stdin = subprocess.PIPE, stdout = f, stderr = f, shell=True)
         # returncode = subprocess.call("./test --gtest_filter='Persist.FrequentCrash'", stdin = subprocess.PIPE, stdout = f, stderr = f, shell=True)
         # returncode = subprocess.call("./test --gtest_filter='Persist.AddPeer'", stdin = subprocess.PIPE, stdout = f, stderr = f, shell=True)
+        # returncode = subprocess.call("./test --gtest_filter='Config.DelLeader'", stdin = subprocess.PIPE, stdout = f, stderr = f, shell=True)
+        # returncode = subprocess.call("./test --gtest_filter='Commit.LeaderChange'", stdin = subprocess.PIPE, stdout = f, stderr = f, shell=True)
         if returncode != 0:
         	print "Test err."
         	return

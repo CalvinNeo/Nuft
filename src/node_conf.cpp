@@ -30,11 +30,12 @@ void RaftNode::apply_conf(std::lock_guard<std::mutex> & guard, const Configurati
         if(conf.old[i] != name && !(conf.state >= Configuration::State::JOINT_NEW && Nuke::contains(conf.rem, conf.old[i]))){
             add_peer(guard, conf.old[i]);
         } else{
-            debug_node("Apply % fail. conf.state %d\n", conf.old[i].c_str(), conf.state);
+            debug_node("Apply %s fail. conf.state %d\n", conf.old[i].c_str(), conf.state);
         }
     }
     for(int i = 0; i < conf.app.size(); i++){
-        if(conf.app[i] != name && (conf.state >= Configuration::State::OLD_JOINT)){
+        if((conf.app[i] != name && (conf.state >= Configuration::State::OLD_JOINT)) ||
+            conf.state == Configuration::State::BLANK){
             add_peer(guard, conf.app[i]);
         }
     }
@@ -195,7 +196,7 @@ void RaftNode::on_update_configuration_finish(std::lock_guard<std::mutex> & guar
     invoke_callback(NUFT_CB_CONF_END, {this, &guard, this->state});
     delete trans_conf;
     trans_conf = nullptr;
-    debug_node("Follower finish updating config.\n");
+    debug_node("Me(Follower) finish updating config.\n");
     persister->Dump(guard);
 }
 
@@ -210,6 +211,7 @@ NodePeer * RaftNode::add_peer(std::lock_guard<std::mutex> & guard, const std::st
         peers[peer_name] = new NodePeer{peer_name};
         peers[peer_name]->send_enabled = true;
         peers[peer_name]->receive_enabled = true;
+        peers[peer_name]->seq = SEQ_START;
         peers[peer_name]->raft_message_client = std::make_shared<RaftMessagesClient>(peer_name, this);
 #if defined(USE_GRPC_STREAM)
         peers[peer_name]->raft_message_client->handle_response();
@@ -238,7 +240,9 @@ void RaftNode::remove_peer(std::lock_guard<std::mutex> & guard, const std::strin
 
         // NOTICE We can't delete here.
         // See `void RaftMessagesStreamClientSync::handle_response():t2` deadlock
+        #if defined(USE_GRPC_STREAM)
         peers[peer_name]->raft_message_client->shutdown();
+        #endif
         tobe_removed_peers.push_back(peers[peer_name]);
         peers[peer_name] = nullptr;
         peers.erase(peer_name);
@@ -272,6 +276,7 @@ void RaftNode::clear_removed_peers(){
 }
 
 void RaftNode::wait_clients_shutdown(){
+    #if defined(USE_GRPC_STREAM)
     while(1){
         for(auto np: tobe_removed_peers){
             if(!np->raft_message_client->is_shutdown()){
@@ -284,6 +289,9 @@ void RaftNode::wait_clients_shutdown(){
         NOT_END:
         continue;
     }
+    #else
+
+    #endif
     debug_node("Clients shutdown.\n");
 }
 
@@ -313,4 +321,60 @@ VOTE_ENOUGH:
     return true;
 VOTE_NOT_ENOUGH:
     return false;
+}
+
+int RaftNode::enough_votes_trans_conf(std::function<bool(const NodePeer &)> f){
+    // "Once a given server adds the new configuration entry to its log,
+    // it uses that configuration for all future decisions (a server
+    // always uses the latest configuration in its log, regardless
+    // of whether the entry is committed). "
+    // NOTICE C_{new} can make decisions sorely in `JOINT_NEW` stage when we decide whether to advance to NEW stage.
+    // "Again, this configuration will take effect on each server as soon as it is seen.
+    // When the new configuration has been committed under
+    // the rules of C_{new}"
+    old_vote = 0; new_vote = 0;
+    if(trans_conf && Nuke::in(trans_conf->state, {Configuration::State::OLD_JOINT, Configuration::State::JOINT})){
+        // Require majority of C_{old} and C_{new}
+        old_vote = 1;
+        new_vote = (trans_conf->is_in_new(name) ? 1 : 0);
+        for(auto & pp: peers){
+            NodePeer & peer = *pp.second;
+            assert(peer.voting_rights);
+            if (f(peer)) {
+                // If got votes from peer
+                if(trans_conf->is_in_old(peer.name)){
+                    old_vote++;
+                }
+                if(trans_conf->is_in_new(peer.name)){
+                    new_vote++;
+                }
+            }
+        }
+        assert(trans_conf->oldvote_thres > 0);
+        assert(trans_conf->newvote_thres > 0);
+        if(old_vote > trans_conf->oldvote_thres / 2 && new_vote > trans_conf->newvote_thres / 2){
+            return 1;
+        }else{
+            return -1;
+        }
+    } 
+    else if(trans_conf && Nuke::in(trans_conf->state, {Configuration::State::NEW, Configuration::State::JOINT_NEW})){
+        // Require majority of C_{new}
+        new_vote = (trans_conf->is_in_new(name) ? 1 : 0);
+        for(auto & pp: peers){
+            NodePeer & peer = *pp.second;
+            assert(peer.voting_rights);
+            if (f(peer)) {
+                if(trans_conf->is_in_new(peer.name)){
+                    new_vote++;
+                }
+            }
+        }
+        if(new_vote > trans_conf->newvote_thres / 2){
+            return 1;
+        }else{
+            return -1;
+        }
+    }
+    return 0;
 }

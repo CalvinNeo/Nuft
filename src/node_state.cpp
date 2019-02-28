@@ -69,7 +69,7 @@ void RaftNode::become_leader(std::lock_guard<std::mutex> & guard) {
         // This strategy is from Mushroom's implementation.
         peer.next_index = commit_index + 1;
 #endif
-        peer.seq = 0;
+        peer.seq = SEQ_START;
     }
 
     // Heartbeat my leadership

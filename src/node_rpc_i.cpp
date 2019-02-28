@@ -128,7 +128,7 @@ int RaftNode::on_install_snapshot_request(raft_messages::InstallSnapshotResponse
     truncate_log(request.last_included_index(), request.last_included_term());
     logs[0].set_command(NUFT_CMD_SNAPSHOT);
     logs[0].set_data(request.data());
-    // Below two asserts DO NOT STAND.
+    // The following two asserts MAY NOT STAND!
     // assert(last_applied < request.last_included_index());
     // assert(commit_index < request.last_included_index());
     commit_index = request.last_included_index();

@@ -65,6 +65,10 @@ typedef RaftMessagesClientSync RaftMessagesClient;
 #define GRPC_SYNC_CONCUR_LEVEL 8 
 #endif
 
+#define SEQ_START 1
+#define USE_MORE_REMOVE
+
+
 struct Persister{
     struct RaftNode * node = nullptr;
     void Dump(std::lock_guard<std::mutex> &, bool backup_conf = false);
@@ -88,7 +92,7 @@ struct NodePeer {
     // Until they are sync-ed.
     bool voting_rights = true;
     // seq nr for next rpc call
-    uint64_t seq = 0;
+    uint64_t seq = SEQ_START;
 };
 
 enum NUFT_RESULT{
@@ -290,6 +294,15 @@ struct RaftNode {
     uint64_t start_timepoint; // Reject RPC from previous test cases.
     // Ref. elaborate_strange_erase.log
     uint64_t last_timepoint; // TODO Reject RPC from previous meeage from current Leader.
+    // Last seq received from Leader
+    // NOTICE Why seq number? See https://groups.google.com/forum/#!topic/raft-dev/kn5vRAtmoSc.
+    // "In the context of Raft, RPC is useful to know which responses comes from 
+    // which requests. If you don't know this, then you can have scenarios like"
+    // "In order to differentiate the messages, there are several approaches 
+    // (non-exhaustive list) : 
+    //  - use an RPC mechanism that gives you the correspondence 
+    //  - use message IDs in requests that are also sent back in responses 
+    //  ..."
     uint64_t last_seq;
 
     // RPC utils for sync
@@ -324,12 +337,16 @@ struct RaftNode {
         return NUFT_OK;
     }
 
+    // TODO NOTICE This function can block, see seq.election.lost.core.7100.noresponse.log, and NuCut's kv
     void set_callback(std::lock_guard<std::mutex> & guard, NUFT_CB_TYPE type, NuftCallbackFunc func){
         callbacks[type] = func;
     }
     void set_callback(NUFT_CB_TYPE type, NuftCallbackFunc func){
+        // fprintf(stderr, "set_callback\n");
         GUARD
+        // fprintf(stderr, "set_callback granted lock\n"); // Original "set_callback gg"
         set_callback(guard, type, func);
+        // fprintf(stderr, "set_callback finish\n");
     }
 
     IndexID get_base_index() const{
@@ -392,62 +409,7 @@ struct RaftNode {
         return voters;
     }
     
-    template <typename F>
-    int enough_votes_trans_conf(F f){
-        // "Once a given server adds the new configuration entry to its log,
-        // it uses that configuration for all future decisions (a server
-        // always uses the latest configuration in its log, regardless
-        // of whether the entry is committed). "
-        // NOTICE C_{new} can make decisions sorely in `JOINT_NEW` stage when we decide whether to advance to NEW stage.
-        // "Again, this configuration will take effect on each server as soon as it is seen.
-        // When the new configuration has been committed under
-        // the rules of C_{new}"
-        old_vote = 0; new_vote = 0;
-        if(trans_conf && Nuke::in(trans_conf->state, {Configuration::State::OLD_JOINT, Configuration::State::JOINT})){
-            // Require majority of C_{old} and C_{new}
-            old_vote = 1;
-            new_vote = (trans_conf->is_in_new(name) ? 1 : 0);
-            for(auto & pp: peers){
-                NodePeer & peer = *pp.second;
-                assert(peer.voting_rights);
-                if (f(peer)) {
-                    // If got votes from peer
-                    if(trans_conf->is_in_old(peer.name)){
-                        old_vote++;
-                    }
-                    if(trans_conf->is_in_new(peer.name)){
-                        new_vote++;
-                    }
-                }
-            }
-            assert(trans_conf->oldvote_thres > 0);
-            assert(trans_conf->newvote_thres > 0);
-            if(old_vote > trans_conf->oldvote_thres / 2 && new_vote > trans_conf->newvote_thres / 2){
-                return 1;
-            }else{
-                return -1;
-            }
-        } 
-        else if(trans_conf && Nuke::in(trans_conf->state, {Configuration::State::NEW, Configuration::State::JOINT_NEW})){
-            // Require majority of C_{new}
-            new_vote = (trans_conf->is_in_new(name) ? 1 : 0);
-            for(auto & pp: peers){
-                NodePeer & peer = *pp.second;
-                assert(peer.voting_rights);
-                if (f(peer)) {
-                    if(trans_conf->is_in_new(peer.name)){
-                        new_vote++;
-                    }
-                }
-            }
-            if(new_vote > trans_conf->newvote_thres / 2){
-                return 1;
-            }else{
-                return -1;
-            }
-        }
-        return 0;
-    }
+    int enough_votes_trans_conf(std::function<bool(const NodePeer &)> f);
     
     NodeName get_leader_name() const{
         // This function helps Clients to locate Leader.
@@ -459,63 +421,9 @@ struct RaftNode {
         return leader_name;
     }
     bool test_election();
-    void on_timer() {
-        // Check heartbeat
-        uint64_t current_ms = get_current_ms();
-
-        GUARD
-        if (!is_running(guard)) return;
-        if ((state == NodeState::Leader) && current_ms >= default_heartbeat_interval + last_tick) {
-            // Leader's routine heartbeat
-            send_heartbeat(guard);
-            last_tick = current_ms;
-        }
-        // Check if leader is timeout
-        if ((state == NodeState::Follower || state == NodeState::Candidate)
-                && (current_ms >= elect_timeout_due)
-                ) { 
-            // Start election(from a Follower), or restart a election(from a Candidate)
-            do_election(guard);
-            // In `do_election`, `leader_name` is set to "".
-            if(state == NodeState::Follower){
-                invoke_callback(NUFT_CB_ELECTION_START, {this, &guard, ELE_NEW});
-            }else{
-                invoke_callback(NUFT_CB_ELECTION_START, {this, &guard, ELE_AGA});
-            }
-        }
-
-        // Check if election is timeout
-        if ((state == NodeState::Candidate)
-                && (current_ms >= election_fail_timeout_due)
-                ) {
-            // In this case, no consensus is reached during the previous election,
-            // We restart a new election.
-            if (test_election()) {
-                // Maybe there is only me in the cluster...
-                become_leader(guard);
-                invoke_callback(NUFT_CB_ELECTION_END, {this, &guard, ELE_SUC});
-            } else {
-                debug_node("Election failed(timeout) with %u votes at term %lu.\n", vote_got, current_term);
-                reset_election_timeout();
-                invoke_callback(NUFT_CB_ELECTION_END, {this, &guard, ELE_T});
-            }
-        }
-
-        if(trans_conf && trans_conf->state == Configuration::State::JOINT && commit_index >= trans_conf->index){
-            update_configuration_new(guard);
-        }
-    }
-
-    void run(std::lock_guard<std::mutex> & guard) {
-        debug_node("Run node. Switch state to Follower.\n");
-        if (state != NodeState::NotRunning) {
-            return;
-        }
-        paused = false;
-        state = NodeState::Follower;
-        persister->Dump(guard, true);
-        reset_election_timeout();
-    }
+    void on_timer();
+    
+    void run(std::lock_guard<std::mutex> & guard);
     void run(){
         GUARD
         run(guard);
@@ -615,18 +523,7 @@ struct RaftNode {
         return is_peer_send_enabled(guard, peer_name);
     }
 
-    void reset_election_timeout() {
-        uint64_t current_ms = get_current_ms();
-        uint64_t delta = get_ranged_random(default_timeout_interval_lowerbound, default_timeout_interval_upperbound);
-        elect_timeout_due = current_ms + delta;
-        #if !defined(_HIDE_HEARTBEAT_NOTICE)
-        debug_node("Sched election after %llums = %llu(+%llu), current %llu. State %s\n", 
-                delta, elect_timeout_due, elect_timeout_due - current_ms, current_ms, node_state_name(state));
-        #endif
-        // `election_fail_timeout_due` should be set only after election begins,
-        // Otherwise it will keep being triggered in `on_time()`
-        election_fail_timeout_due = UINT64_MAX;
-    }
+    void reset_election_timeout();
 
     NodePeer * add_peer(std::lock_guard<std::mutex> & guard, const std::string & peer_name);
     NodePeer * add_peer(const std::string & peer_name);
@@ -638,25 +535,8 @@ struct RaftNode {
     void clear_removed_peers();
     void wait_clients_shutdown();
     
-    void do_apply(bool from_snapshot = false) {
-        GUARD
-        do_apply(guard, from_snapshot);
-    }
-    void do_apply(std::lock_guard<std::mutex> & guard, bool from_snapshot = false) {
-        assert(!(from_snapshot && gl(last_applied + 1).command() != NUFT_CMD_SNAPSHOT));
-        debug_node("Do apply from %lld to %lld\n", last_applied + 1, commit_index);
-        for(IndexID i = last_applied + 1; i <= commit_index; i++){
-            ApplyMessage * applymsg = new ApplyMessage{i, gl(i).term(), name, from_snapshot, gl(i).data()};
-            NuftResult res = invoke_callback(NUFT_CB_ON_APPLY, {this, &guard, 0, 0, applymsg});
-            if(res != NUFT_OK){
-                debug_node("Apply fail at %lld\n", i);
-            }else{
-                last_applied = i;
-            }
-            delete applymsg;
-        }
-        debug_node("Do apply end.\n");
-    }
+    void do_apply(bool from_snapshot = false);
+    void do_apply(std::lock_guard<std::mutex> & guard, bool from_snapshot = false);
 
     void send_heartbeat(std::lock_guard<std::mutex> & guard);
     void switch_to(std::lock_guard<std::mutex> & guard, NodeState new_state);
@@ -677,7 +557,6 @@ struct RaftNode {
 
     template <typename R>
     bool handle_request_routine(std::lock_guard<std::mutex> & guard, const R & request){
-
         if (request.term() < current_term) {
             debug_node("Reject AppendEntriesRequest/InstallSnapshotRequest from %s, because it has older term %llu, me %llu. It maybe a out-dated Leader\n", request.name().c_str(), request.term(), current_term);
             return false;
@@ -733,54 +612,43 @@ struct RaftNode {
     int on_append_entries_request(raft_messages::AppendEntriesResponse * response_ptr, const raft_messages::AppendEntriesRequest & request);
     void on_append_entries_response(const raft_messages::AppendEntriesResponse & response, bool heartbeat);
 
-    NuftResult get_log(IndexID index, ::raft_messages::LogEntry & l) {
-        GUARD
+    NuftResult get_log(std::lock_guard<std::mutex> & guard, IndexID index, ::raft_messages::LogEntry & l) {
         if(index <= last_log_index()){
             l = gl(index);
             return NUFT_OK;
         }
         return -NUFT_FAIL;
     }
-    
-    // NuftResult do_log(std::lock_guard<std::mutex> & guard, ::raft_messages::LogEntry entry, int command = 0){
-    //     auto x = [](RaftNode *){};
-    //     return do_log(guard, entry, x, command);
-    // }
-    // NuftResult do_log(std::lock_guard<std::mutex> & guard, const std::string & log_string){
-    //     auto x = [](RaftNode *){};
-    //     return do_log(guard, log_string, x);
-    // }
-    template <typename F>
-    NuftResult do_log(std::lock_guard<std::mutex> & guard, ::raft_messages::LogEntry entry, F f, int command){
-        if(state != NodeState::Leader){
-            // No, I am not the Leader, so please find the Leader first of all.
-            debug_node("Not Leader!!!!!\n");
-            return -NUFT_NOT_LEADER;
-        }
-        if(!is_running(guard)){
-            debug_node("Not Running!!!!\n");
-            return -NUFT_FAIL;
-        }
-        IndexID index = last_log_index() + 1;
-        entry.set_term(this->current_term);
-        entry.set_index(index);
-        entry.set_command(command);
-        logs.push_back(entry);
-        f(this);
-        if(persister) persister->Dump(guard);
-        
-        debug_node("Append LOCAL log Index %lld, Term %llu, commit_index %lld. Now copy to peers.\n", index, current_term, commit_index);
-        // "The leader appends the command to its log as a new entry, then issues AppendEntries RPCs in parallel..."
-        do_append_entries(guard, false);
-        return index;
+    NuftResult get_log(IndexID index, ::raft_messages::LogEntry & l) {
+        GUARD
+        return get_log(guard, index, l);
     }
-    template <typename F>
-    NuftResult do_log(std::lock_guard<std::mutex> & guard, const std::string & log_string, F f){
+    // Major
+    NuftResult do_log(std::lock_guard<std::mutex> & guard, ::raft_messages::LogEntry entry, std::function<void(RaftNode*)> f, int command);
+    NuftResult do_log(std::lock_guard<std::mutex> & guard, const std::string & log_string, std::function<void(RaftNode*)> f){
         ::raft_messages::LogEntry entry;
         entry.set_data(log_string);
         return do_log(guard, entry, f, NUFT_CMD_NORMAL);
     }
+    NuftResult do_log(std::lock_guard<std::mutex> & guard, const std::string & log_string, std::function<void(RaftNode*)> f, int command){
+        ::raft_messages::LogEntry entry;
+        entry.set_data(log_string);
+        return do_log(guard, entry, f, command);
+    }
+
     // For API usage
+    NuftResult do_log(::raft_messages::LogEntry entry, std::function<void(RaftNode*)> f, int command){
+        GUARD
+        return do_log(guard, entry, f, command);
+    }
+    NuftResult do_log(const std::string & log_string, std::function<void(RaftNode*)> f){
+        GUARD
+        return do_log(guard, log_string, f);
+    }
+    NuftResult do_log(const std::string & log_string, std::function<void(RaftNode*)> f, int command){
+        GUARD
+        return do_log(guard, log_string, f, command);
+    }
     NuftResult do_log(::raft_messages::LogEntry entry, int command){
         GUARD
         return do_log(guard, entry, [](RaftNode *){}, command);
@@ -789,15 +657,9 @@ struct RaftNode {
         GUARD
         return do_log(guard, log_string, [](RaftNode *){});
     }
-    template <typename F>
-    NuftResult do_log(::raft_messages::LogEntry entry, F f, int command){
+    NuftResult do_log(const std::string & log_string, int command){
         GUARD
-        return do_log(guard, entry, f, command);
-    }
-    template <typename F>
-    NuftResult do_log(const std::string & log_string, F f){
-        GUARD
-        return do_log(guard, log_string, f);
+        return do_log(guard, log_string, [](RaftNode *){}, command);
     }
     
     // API
@@ -810,137 +672,27 @@ struct RaftNode {
     void update_configuration_finish(std::lock_guard<std::mutex> & guard);
     void on_update_configuration_finish(std::lock_guard<std::mutex> & guard);
 
-    void safe_leave(std::lock_guard<std::mutex> & guard){
-        // Remove Leader safely when new conf is committed on peer.
-        // Remove Peer safely 
-        if(state == NodeState::Leader){
-            debug_node("Leader is not in C_{new}, step down and stop.\n");
-        }else{
-            debug_node("I am not in C_{new}, stop.\n");
-        }
-        become_follower(guard, current_term);
-        stop(guard);
-    }
-
+    void safe_leave(std::lock_guard<std::mutex> & guard);
     void safe_leave(){
         GUARD
         safe_leave(guard);
     }
+
     template<typename T>
     void set_seq_nr(NodePeer & peer, T & request){
-        if(peer.seq == 0){
+        if(peer.seq == 1){
             request.set_initial(true);
         }else{
             request.set_initial(false);
         }
-        peer.seq++;
         request.set_seq(peer.seq);
+        peer.seq++;
     }
-    bool valid_seq(uint64_t seq, bool initial){
-        if(initial){
-            last_seq = seq;
-            return true;
-        }else if(seq > last_seq){
-            last_seq = seq;
-            return true;
-        }
-        return false;
-    }
+    bool valid_seq(uint64_t seq, bool initial);
 
-    RaftNode(const std::string & addr) : state(NodeState::NotRunning), name(addr) {
-        current_term = default_term_cursor;
-        vote_for = vote_for_none;
-        leader_name = "";
-        trans_conf = nullptr;
-        persister = new Persister{this};
-        commit_index = default_index_cursor;
-        last_applied = default_index_cursor;
-        paused = false;
-        tobe_destructed = false;
-        last_tick = 0; 
-        elect_timeout_due = 0; 
-        election_fail_timeout_due = 0; 
-        vote_got = 0;
-        new_vote = 0;
-        old_vote = 0;
-        // NOTICE In a streaming implementation, I need to first listen to some port, 
-        // then create a client
-        #if defined(USE_GRPC_STREAM)
-        raft_message_server = new RaftStreamServerContext(this);
-        #else
-        raft_message_server = new RaftServerContext(this);
-        #endif
-        using namespace std::chrono_literals;
-#if defined(USE_GRPC_SYNC) && !defined(USE_GRPC_STREAM) && !defined(USE_GRPC_SYNC_BARE)
-        // sync_client_task_queue = std::make_shared<Nuke::ThreadExecutor>(GRPC_SYNC_CONCUR_LEVEL);
-        sync_client_task_queue = new Nuke::ThreadExecutor(GRPC_SYNC_CONCUR_LEVEL);
-#endif
-        start_timepoint = get_current_ms();
-        last_seq = 0;
-        timer_thread = std::thread([&]() {
-            while (1) {
-                if(tobe_destructed){
-                    return;
-                }
-                this->on_timer();
-                std::this_thread::sleep_for(std::chrono::duration<int, std::milli> {default_heartbeat_interval});
-            }
-        });
-    }
+    RaftNode(const std::string & addr);
     RaftNode(const RaftNode &) = delete;
-    ~RaftNode() {
-        debug_node("Destruct RaftNode.\n");
-        {
-            GUARD
-            tobe_destructed = true;
-            paused = true;
-            state = NodeState::NotRunning;
-            debug_node("Reset Peers \n");
-            reset_peers(guard);
-            debug_node("Delete Persister \n");
-            delete persister;
-        }
-        {
-            // NOTICE We must first release mut, then acquire it.
-            // See `void RaftMessagesStreamClientSync::handle_response():t2` deadlock
-            debug_node("Clear Deleted Peers \n");
-            // wait_clients_shutdown();
-            clear_removed_peers();
-        }
-
-        {
-            // NOTICE See stream.clear.timeout.log
-            // Seems a deadlock may happend when join
-            debug_node("Wait timer_thread join\n");
-            timer_thread.join();
-            debug_node("timer_thread Joined\n");
-        }
-        {
-            debug_node("Delete Server\n");
-            // This may block forever even we called shutdown.
-            delete raft_message_server;
-            raft_message_server = nullptr;
-            debug_node("Delete Server End\n");
-        }
-        {
-            GUARD
-            debug_node("Delete Conf\n");
-            if(trans_conf){
-                delete trans_conf;
-            }
-        }
-#if defined(USE_GRPC_SYNC) && !defined(USE_GRPC_STREAM) && !defined(USE_GRPC_SYNC_BARE)
-        // TODO this will sometimes blocks at thread pool.
-        // I think it may because of:
-        // 1. ~RaftNode locks mut
-        // 2. delete `sync_client_task_queue` will wait until all pending RPCs are handled
-        // 3. one response arrived, e.g. call `on_append_entries_response`
-        // 4. it will try to acquire mut again
-        // 5. deadlock
-        delete sync_client_task_queue;
-#endif
-        debug_node("Destruct finish\n");
-    }
+    ~RaftNode();
 };
 
 RaftNode * make_raft_node(const std::string & addr);

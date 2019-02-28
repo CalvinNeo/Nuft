@@ -29,8 +29,8 @@
 #include <thread>
 
 #include <grpcpp/grpcpp.h>
-#include "raft_messages.grpc.pb.h"
-#include "raft_messages.pb.h"
+#include "grpc/raft_messages.grpc.pb.h"
+#include "grpc/raft_messages.pb.h"
 #include "utils.h"
 #include "settings.h"
 
@@ -53,7 +53,7 @@ using grpc::CompletionQueue;
 inline bool monitor_delayed(uint64_t send_time){
     uint64_t delta = get_current_ms() - send_time;
     if(delta > MONITOR_DELAY_THRES){
-        printf("GRPC: Delayed gRPC Call for %llu ms!!\n", delta);
+        debug("GRPC: Delayed gRPC Call for %llu ms!!\n", delta);
         return true;
     }
     return false;
@@ -164,7 +164,7 @@ private:
 
 #if defined(USE_GRPC_ASYNC)
 
-struct RaftMessagesClientAsync {
+struct RaftMessagesClientAsync : std::enable_shared_from_this<RaftMessagesClientAsync> {
     // `RaftMessagesClientAsync` defines how to make a async RPC call, and how to handle its results.
     using RequestVoteResponse = ::raft_messages::RequestVoteResponse;
     using RequestVoteRequest = ::raft_messages::RequestVoteRequest;
@@ -201,6 +201,8 @@ struct RaftMessagesClientAsync {
     ~RaftMessagesClientAsync() {
         raft_node = nullptr;
         cq.Shutdown();
+        cq_thread.join(); 
+        debug("RaftMessagesClientAsync Destroyed.\n");
     }
 private:
     std::unique_ptr<raft_messages::RaftMessages::Stub> stub;

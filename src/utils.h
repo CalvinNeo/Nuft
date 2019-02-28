@@ -57,6 +57,3 @@ struct RaftNodeLogger{
     void dolog(RaftNodeLogger & context, char const * file_name, char const * func_name, int line, int level, char const * fmt, va_list va);
 };
 
-#define LOGLEVEL_DEBUG 5
-// #define debug NUKE_LOG
-#define debug printf

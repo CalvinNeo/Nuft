@@ -109,6 +109,8 @@ RaftMessagesStreamClientSync::~RaftMessagesStreamClientSync() {
 }
 
 void RaftMessagesStreamClientSync::handle_response(){
+    // NOTICE We can't use shared_from_this inside constructor.
+    // So we have `handle_response`
     auto strongThis = shared_from_this();
     t1 = new std::thread([this](){
         std::string peer_name = this->peer_name;

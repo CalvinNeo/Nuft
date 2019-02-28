@@ -68,13 +68,14 @@ void RaftNode::do_append_entries(std::lock_guard<std::mutex> & guard, bool heart
                 entry = gl(i);
             }
 
+            set_seq_nr(peer, request);
+
             #if defined(_HIDE_HEARTBEAT_NOTICE)
             if(heartbeat){}else
             #endif
-            debug_node("Send %s AppendEntriesRequest to %s, size %u term %llu.\n", 
+            debug_node("Send %s AppendEntriesRequest to %s, size %u, term %llu, seq %llu.\n", 
                     heartbeat ? "heartbeat": "normal", peer.name.c_str(), request.entries_size(),
-                    current_term);
-            set_seq_nr(peer, request);
+                    current_term, request.seq());
             peer.raft_message_client->AsyncAppendEntries(request, heartbeat);
         }
     }
@@ -123,12 +124,15 @@ int RaftNode::on_append_entries_request(raft_messages::AppendEntriesResponse * r
     }
 
     if(!valid_seq(request.seq(), request.initial())){
-        debug_node("Out-of-ordered AppendEntriesRequest last_seq %llu, request.seq() = %llu\n", last_seq, request.seq());
+        // "Raft doesn't rely on the ordering guarantees or duplicate elimination 
+        // at the transport layer; its RPCs contain enough information to be 
+        // processed out of order safely. "
+        debug_node("Out-of-ordered AppendEntriesRequest from %s last_seq %llu, request.seq() = %llu\n", request.name().c_str(), last_seq, request.seq());
         return -1;
     }
 
     // `request.prev_log_index() == -1` happens at the very beginning when a Leader with no Log, and send heartbeats to others.
-    if (request.prev_log_index() >= 0 && request.prev_log_index() > last_log_index()) {
+    if(request.prev_log_index() >= 0 && request.prev_log_index() > last_log_index()) {
         // I don't have the `prev_log_index()` entry.
         debug_node("AppendEntries fail. I don't have prev_log_index = %lld, my last_log_index = %lld.\n", request.prev_log_index(), last_log_index());
         goto end;
@@ -136,57 +140,121 @@ int RaftNode::on_append_entries_request(raft_messages::AppendEntriesResponse * r
     if(request.prev_log_index() >= 0 && request.prev_log_index() < last_log_index()){
         // I have some log entries(from former Leader), which current Leader don't have.
         // Can erase them only we conflicts happen.
-        // debug_node("My last_log_index = %u > request.prev_log_index() = %lld. Maybe still probing, maybe condition 5.4.2(b)\n", last_log_index(), request.prev_log_index());
+
+        // debug_node("My last_log_index = %u > request.prev_log_index() = %lld. Maybe still probing, maybe condition 5.4.2(b)\n", 
+        //     last_log_index(), request.prev_log_index());
     }
     // "If an existing entry conflicts with a new one (same index but different terms),
     // delete the existing entry and all that follow it"
-    // TODO IMPORTANT When I convert this into MIT 6.824 tests, It will fail TestFigure8Unreliable2C
+    // At a early implementation When I convert this into MIT 6.824 tests, It will fail TestFigure8Unreliable2C.
+    // The following explanation shows why. (https://thesquareplanet.com/blog/raft-qa/)
+    // The leader is essentially probing the follower’s log to find the last point where the two agree. 
+    // This is what the nextIndex variable is used for. The follower helps the leader do this by 
+    // a) rejecting any AppendEntries RPCs that doesn’t immediately follow a point where the two agree (this is #2), 
+    // b) overwriting any following entries in its log once #2 is satisfied (this is #3).
 
     if(request.prev_log_index() == default_index_cursor){
         // If Leader has no entry, then we definitely not match.
-        goto DO_ERASE;
+        goto NO_CONFLICT;
     }
     if(request.prev_log_index() > get_base_index()){
-        TermID wrong_term = gl(request.prev_log_index()).term();
-        if(request.prev_log_term() != wrong_term){
+        // If the Leader's prev_log_index is not compacted by me yet.
+        TermID local_term = gl(request.prev_log_index()).term();
+        if(request.prev_log_term() != local_term){
+            // If my last logs term mismatch the Leader's. Erase to maintain Log Matching Principle.
             for(IndexID i = request.prev_log_index() - 1; i >= default_index_cursor; i--){
                 if(i == default_index_cursor){
-                    debug_node("Revoke last_log_index to %lld, remove all wrong entries of term %llu.\n", default_index_cursor, wrong_term);
+                    debug_node("Revoke last_log_index to %lld, remove all wrong entries of term %llu.\n", default_index_cursor, local_term);
                     response.set_last_log_index(default_index_cursor);
                     response.set_last_log_term(default_term_cursor);
-                    // NOTICE Seems we need to IMMEDIATELY remove! See seq.concurrent.log !!!
+                    // NOTICE We need to IMMEDIATELY remove! See seq.concurrent.log !!!
                     // Otherwise, `commit_index` can later be advanced to a wrong index, which should have already be erased.
                     logs.erase(logs.begin(), logs.end());
-                } else if(gl(i).term() != wrong_term){
+                } else if(gl(i).term() != local_term){
                     // Now we found non conflict entries.
-                    debug_node("Revoke last_log_index to %lld, remove all wrong entries of term %llu.\n", i, wrong_term);
+                    debug_node("Revoke last_log_index to %lld, remove all wrong entries of term %llu.\n", i, local_term);
                     response.set_last_log_index(i);
                     response.set_last_log_term(gl(i).term());
-                    // NOTICE Seems we need to IMMEDIATELY remove! See seq.concurrent.log !!!
+                    // NOTICE We need to IMMEDIATELY remove! See seq.concurrent.log !!!
                     logs.erase(logs.begin() + i + 1 - get_base_index(), logs.end());
                 }
                 // Otherwise continue loop
             }
             debug_node("Revoke last_log_index finished, request.prev_log_index() = %lld, request.prev_log_term() = %llu, response.prev_log_index() = %lld, response.prev_log_term() = %llu, wrong_term %llu, request.seq() %llu.\n", 
-                request.prev_log_index(), request.prev_log_term(), response.last_log_index(), response.last_log_term(), wrong_term, request.seq());
+                request.prev_log_index(), request.prev_log_term(), response.last_log_index(), response.last_log_term(), local_term, request.seq());
+            // Term mismatch, can't move forward.
             goto end2;
         }
     }
-DO_ERASE:
+    // Now Log Matching Principle is maintained before(including) request.prev_log_index().
+    // However, after the following, this Priciple may not stands.
+    //            PREV LOG IND
+    // Follower:    COMMITTED   | PREV LEADER'S LOG
+    // Leader:      COMMITTED   |
+NO_CONFLICT:
     if(request.prev_log_index() >= get_base_index()){
-        // Reserve logs range (, request.prev_log_index()]
-        // NOTICE According to https://thesquareplanet.com/blog/raft-qa/, we should erase fewer log entries we the new entry is prefix of the older entry.
+        // If the Leader's prev_log_index is not compacted by me yet.
+        
+        // NOTICE According to https://thesquareplanet.com/blog/raft-qa/, we should erase fewer log entries when the new entry is prefix of the older entry.
         // This is related to re-ordered RPC topic. See `TEST(Snapshot, Lost)` for more information.
+        #ifdef USE_MORE_REMOVE
         if(request.prev_log_index() + 1 <= last_log_index()){
-            // NOTICE There is a error where `on_update_configuration_joint` is called IMMEDIATELY before Erase. 
-            // This is solved and is because I mixed up some `NUFT_CMD_*`s in some early version.
-            debug_node("Erase [%lld, ). Before, last_log_index %lld, on Leader's side, prev_log_index %lld. logs = %s\n", 
-                request.prev_log_index() + 1, last_log_index(), request.prev_log_index(), print_logs().c_str());
+            // If request's entries overlaps my entries.
+            // There is a error where `on_update_configuration_joint` is called IMMEDIATELY before Erase, 
+            // And this is solved and is because I mixed up some `NUFT_CMD_*`s in some early version.
+            IndexID overlap_length = last_log_index() - request.prev_log_index();
+            debug_node("Erase [%lld, ). Before, last_log_index %lld, on Leader's side, prev_log_index %lld. logs = %s, overlap_length %lld\n", 
+                request.prev_log_index() + 1, last_log_index(), request.prev_log_index(), print_logs().c_str(), overlap_length);
+            // Reserve logs range (, request.prev_log_index()]
             logs.erase(logs.begin() + request.prev_log_index() + 1 - get_base_index(), logs.end());
             debug_node("Insert size %u\n", request.entries_size());
         }
         logs.insert(logs.end(), request.entries().begin(), request.entries().end());
         // debug_node("Do Insert size %u\n", request.entries_size());
+        #else
+        IndexID local_logs_index_start = find_entry(request.prev_log_index(), request.prev_log_term());
+        // debug_node("Find (%lld, %llu) = %lld.\n", request.prev_log_index(), request.prev_log_term(), local_logs_index_start);
+        // Copy entries so that logs[local_logs_index+1:) = entries[0:)
+        int leader_logs_index = 0;
+        IndexID local_logs_index = local_logs_index_start + 1;
+        if(local_logs_index_start == default_index_cursor){
+            // If I have no logs, simply append.
+
+            // debug_node("Insert from %d to %d\n", leader_logs_index, request.entries_size());
+            logs.insert(logs.end(), request.entries().begin() + leader_logs_index, request.entries().end());
+        }else{
+            for(; local_logs_index < logs.size() && leader_logs_index < request.entries_size(); local_logs_index++, leader_logs_index++){
+                if(logs[local_logs_index].term() != request.entries(leader_logs_index).term()){
+                    break;
+                }
+            }
+            // Find smallest dismatching pair (local_logs_index, leader_logs_index).
+            if(local_logs_index < logs.size() && leader_logs_index < request.entries_size()){
+                // If there is conflict.
+                debug_node("Erase [%lld, ). Before, last_log_index %lld, on Leader's side, prev_log_index %lld. logs = %s\n", 
+                    logs[local_logs_index].index(), last_log_index(), request.prev_log_index(), print_logs().c_str());
+                logs.erase(logs.begin() + local_logs_index, logs.end());
+            }else if(local_logs_index < logs.size()){
+                // If leader's log has fewer entries.
+                // Remove extra entries appended by prev leader.
+                for(; local_logs_index < logs.size(); local_logs_index++){
+                    if(logs[local_logs_index].term() != request.term()){
+                        logs.erase(logs.begin() + local_logs_index, logs.end());
+                        break;
+                    }
+                }
+            }else if(leader_logs_index < request.entries_size()){
+                // If local log has fewer entries.
+            }
+            if(leader_logs_index < request.entries_size()){
+                // debug_node("Insert from %d to %d\n", leader_logs_index, request.entries_size());
+                logs.insert(logs.end(), request.entries().begin() + leader_logs_index, request.entries().end());
+            }else{
+                // debug_node("Can't Insert leader_logs_index = %d, entries.size() = %d, local_logs_index = %d, logs.size() = %d, logs = %s\n", 
+                    // leader_logs_index, request.entries_size(), local_logs_index, logs.size(), print_logs().c_str());
+            }
+        }
+        #endif
     }
 
     if (request.leader_commit() > commit_index) {
@@ -194,9 +262,10 @@ DO_ERASE:
         // According to Figure2 Receiver Implementation 5.
         // Necessary, see https://thesquareplanet.com/blog/students-guide-to-raft/
         // assert(request.leader_commit() <= last_log_index());
+        IndexID old_commit_index = commit_index;
         commit_index = std::min(request.leader_commit(), last_log_index());
-        debug_node("Leader %s ask me to advance commit_index to %lld, seq %llu, request.prev_log_index() %lld, last_log_index() = %lld.\n", 
-            request.name().c_str(), commit_index, request.seq(), request.prev_log_index(), last_log_index());
+        debug_node("Leader %s ask me to advance commit_index from %lld to %lld, seq %llu, request.prev_log_index() %lld, last_log_index() = %lld.\n", 
+            request.name().c_str(), old_commit_index, commit_index, request.seq(), request.prev_log_index(), last_log_index());
         do_apply(guard);
     }else{
         if(request.entries_size()){
@@ -433,3 +502,26 @@ CANT_COMMIT:
     }
 }
 
+NuftResult RaftNode::do_log(std::lock_guard<std::mutex> & guard, ::raft_messages::LogEntry entry, std::function<void(RaftNode*)> f, int command){
+    if(state != NodeState::Leader){
+        // No, I am not the Leader, so please find the Leader first of all.
+        debug_node("Not Leader!!!!!\n");
+        return -NUFT_NOT_LEADER;
+    }
+    if(!is_running(guard)){
+        debug_node("Not Running!!!!\n");
+        return -NUFT_FAIL;
+    }
+    IndexID index = last_log_index() + 1;
+    entry.set_term(this->current_term);
+    entry.set_index(index);
+    entry.set_command(command);
+    logs.push_back(entry);
+    f(this);
+    if(persister) persister->Dump(guard);
+    
+    debug_node("Append LOCAL log Index %lld, Term %llu, commit_index %lld. Now copy to peers.\n", index, current_term, commit_index);
+    // "The leader appends the command to its log as a new entry, then issues AppendEntries RPCs in parallel..."
+    do_append_entries(guard, false);
+    return index;
+}
