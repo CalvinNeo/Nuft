@@ -44,11 +44,12 @@ void RaftNode::apply_conf(std::lock_guard<std::mutex> & guard, const Configurati
 
 NuftResult RaftNode::update_configuration(const std::vector<std::string> & app, const std::vector<std::string> & rem){
     GUARD
+    if(is_busy()){return NUFT_RETRY;}
     if(state != NodeState::Leader || paused){
         return -NUFT_NOT_LEADER;
     }
     if(trans_conf){
-        // On the way.
+        // There is another conf trans on the way.
         return -NUFT_FAIL;
     }
     trans_conf = new Configuration(app, rem, peers, name);

@@ -177,6 +177,8 @@ int RaftNode::on_append_entries_request(raft_messages::AppendEntriesResponse * r
                     response.set_last_log_term(gl(i).term());
                     // NOTICE We need to IMMEDIATELY remove! See seq.concurrent.log !!!
                     logs.erase(logs.begin() + i + 1 - get_base_index(), logs.end());
+                    // Add break according to zl951116zl(wechat) from nowcoder
+                    break;
                 }
                 // Otherwise continue loop
             }

@@ -517,3 +517,8 @@ void print_peers(RaftNode * ob){
         return pr.second->name;
     }).c_str());
 }
+
+IndexID DoWhip(RaftNode * leader){
+    printf("GTEST: Now Whip\n");
+    return leader->do_log("Whip", NUFT_CMD_NOP);
+}

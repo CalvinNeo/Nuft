@@ -586,8 +586,7 @@ TEST(Persist, CrashAll){
         }
         print_state();
     }
-    printf("GTEST: Now Whip\n");
-    leader->do_log("Whip");
+    DoWhip(leader);
     std::this_thread::sleep_for(1s);
     ASSERT_EQ(CheckCommit(ln, "Whip"), n);
     FreeRaftNodes();
@@ -686,8 +685,7 @@ TEST(Persist, FrequentCrash){
             print_state();
         }
     }
-    printf("GTEST: Whip\n");
-    leader->do_log("Whip\n");
+    DoWhip(leader);
     std::this_thread::sleep_for(1s);
     ASSERT_EQ(leader->commit_index, tot);
     ASSERT_EQ(leader->last_applied, tot);
@@ -825,7 +823,7 @@ void GenericTest(int tot = 100, int n = 5, int snap_interval = -1, bool test_los
     std::this_thread::sleep_for(std::chrono::duration<int, std::milli>{10 * tot * clients});
     RaftNode * leader = PickNode({RN::Leader});
     // Prevent "can't commit logs replicated by previous Leaders".
-    NuftResult whip_id = leader->do_log("0=Whip");
+    NuftResult whip_id = DoWhip(leader);
     ASSERT_LE(whip_id, tot * clients);
     printf("GTEST: Whip at %d\n", whip_id);
     std::this_thread::sleep_for(std::chrono::duration<int, std::milli>{30 * tot * clients});

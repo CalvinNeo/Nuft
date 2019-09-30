@@ -62,7 +62,7 @@ void Persister::Dump(std::lock_guard<std::mutex> & guard, bool backup_conf){
     fo.close();
 }
 void Persister::Load(std::lock_guard<std::mutex> & guard){
-    printf("PERSISTER: LOAD %s\n", node->name.c_str());
+    debug("PERSISTER: LOAD %s\n", node->name.c_str());
     std::fstream fo{(node->name + std::string(".persist")).c_str(), std::ios::binary | std::ios::in};
     raft_messages::PersistRecord record;
     record.ParseFromIstream(&fo);

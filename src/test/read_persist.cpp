@@ -29,7 +29,9 @@ int main(int argc, char * argv[]){
         printf("Please input persist node name.\n");
         return 0;
     }
-    std::fstream fo{(argv[1] + std::string(".persist")).c_str(), std::ios::binary | std::ios::in};
+    std::string nn = argv[1] + std::string(".persist");
+    printf("File %s\n", nn.c_str());
+    std::fstream fo{nn.c_str(), std::ios::binary | std::ios::in};
     raft_messages::PersistRecord record;
     record.ParseFromIstream(&fo);
     printf("current_term: %d\n", record.term());

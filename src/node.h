@@ -118,6 +118,7 @@ enum NUFT_CMD_TYPE {
     NUFT_CMD_TRANS = 1,
     NUFT_CMD_SNAPSHOT = 2,
     NUFT_CMD_TRANS_NEW = 3,
+    NUFT_CMD_NOP = 4,
     NUFT_CMD_SIZE,
 };
 struct NuftCallbackArg{
@@ -554,6 +555,17 @@ struct RaftNode {
     int on_vote_request(raft_messages::RequestVoteResponse * response_ptr, const raft_messages::RequestVoteRequest & request);
     void on_vote_response(const raft_messages::RequestVoteResponse & response);
 
+    void still_leader(){
+        // TODO NOTICE This is not required currently, because we now commit a log to read.
+        // Second, a leader must check whether it has been deposed before processing a read-only request 
+        // (its information may be stale if a more recent leader has been elected).
+    }
+
+    bool is_busy(){
+        // Return true if the cluster is busy, so we return with a NUFT_RETRY reponse.
+        // TODO
+        return false;
+    }
 
     template <typename R>
     bool handle_request_routine(std::lock_guard<std::mutex> & guard, const R & request){
@@ -639,26 +651,32 @@ struct RaftNode {
     // For API usage
     NuftResult do_log(::raft_messages::LogEntry entry, std::function<void(RaftNode*)> f, int command){
         GUARD
+        if(is_busy()){return NUFT_RETRY;}
         return do_log(guard, entry, f, command);
     }
     NuftResult do_log(const std::string & log_string, std::function<void(RaftNode*)> f){
         GUARD
+        if(is_busy()){return NUFT_RETRY;}
         return do_log(guard, log_string, f);
     }
     NuftResult do_log(const std::string & log_string, std::function<void(RaftNode*)> f, int command){
         GUARD
+        if(is_busy()){return NUFT_RETRY;}
         return do_log(guard, log_string, f, command);
     }
     NuftResult do_log(::raft_messages::LogEntry entry, int command){
         GUARD
+        if(is_busy()){return NUFT_RETRY;}
         return do_log(guard, entry, [](RaftNode *){}, command);
     }
     NuftResult do_log(const std::string & log_string){
         GUARD
+        if(is_busy()){return NUFT_RETRY;}
         return do_log(guard, log_string, [](RaftNode *){});
     }
     NuftResult do_log(const std::string & log_string, int command){
         GUARD
+        if(is_busy()){return NUFT_RETRY;}
         return do_log(guard, log_string, [](RaftNode *){}, command);
     }
     

@@ -131,6 +131,11 @@ void RaftNode::do_apply(std::lock_guard<std::mutex> & guard, bool from_snapshot)
     assert(!(from_snapshot && gl(last_applied + 1).command() != NUFT_CMD_SNAPSHOT));
     debug_node("Do apply from %lld to %lld\n", last_applied + 1, commit_index);
     for(IndexID i = last_applied + 1; i <= commit_index; i++){
+        if(gl(i).command() == NUFT_CMD_NOP){
+            debug_node("Log[%lld] is NOP, don't apply.\n", i);
+            last_applied = i;
+            continue;
+        }
         ApplyMessage * applymsg = new ApplyMessage{i, gl(i).term(), name, from_snapshot, gl(i).data()};
         NuftResult res = invoke_callback(NUFT_CB_ON_APPLY, {this, &guard, 0, 0, applymsg});
         if(res != NUFT_OK){
