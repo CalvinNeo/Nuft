@@ -80,6 +80,10 @@ int RaftNode::on_vote_request(raft_messages::RequestVoteResponse * response_ptr,
         debug_node("Become Follower: Receive RequestVoteRequest from %s with new term of %llu, me %llu. My last_log_index %lld, peer %lld\n", 
             request.name().c_str(), request.term(), current_term, last_log_index(), last_log_term());
         // NOTICE We can't set `vote_for` to none here, or will cause multiple Leader elected(ref strange_failure3.log)
+        // EG:
+        // 1. A/B went into election at the same time，CD vote for A and E for B
+        // 2. C crashed，and received B's vote_request after immediate restart, and it will vote for B
+        // 3. Now A and B both have 2 votes.
         // TODO An optimation from the Raft Paper Chapter 7 Issue 3: 
         // "removed servers can disrupt the cluster. These servers will not receive heartbeats, so they will time out and start new elections.
         // They will then send RequestVote RPCs with new term numbers, and this will cause the current leader to revert to follower state."

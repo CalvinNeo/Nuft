@@ -201,8 +201,13 @@ TEST(Commit, FollowerLost){
     std::this_thread::sleep_for(1s);
     // We use log entry "A" to force a commit_index advancing, otherwise "DOOMED" wont'be committed. 
     // ref `on_append_entries_response`
+    print_state();
     leader->do_log("A");
-    std::this_thread::sleep_for(1s);
+    // Accroding to follower.lost.stepdown_after_send.log, 
+    // it could happend when victim2 not heard from leader.
+    // So I increase sleep from 1s to 3s.
+    std::this_thread::sleep_for(3s);
+    print_state();
     printf("GTEST: now check entries.\n");
     // Now, this entry should be committed, because victim2 re-connected.
     ASSERT_GE(CheckCommit(ln + 1, "A"), MajorityCount(n));
@@ -299,7 +304,9 @@ TEST(Commit, NetworkPartition){
     // seq.networkpartition.checklog.log shows it is not enough
     // std::this_thread::sleep_for(TimeEnsureNoElection());
     std::this_thread::sleep_for(1s);
+    // Log1 is fully accepted and commited because it is before network partition.
     ASSERT_EQ(CheckCommit(0, "1"), 5);
+    // On no nodes is Log2 commited, but there are no conflicts for now.
     ASSERT_EQ(CheckCommit(1, "2"), 0);
     ASSERT_EQ(CheckLog(1, "2"), 2);
     ASSERT_EQ(nodes[l1]->commit_index, 0);
@@ -309,7 +316,7 @@ TEST(Commit, NetworkPartition){
     std::this_thread::sleep_for(TimeEnsureSuccessfulElection());
     print_state();
     ASSERT_EQ(CountLeader(), 2);
-    // There are 2 Leaders in both parts.
+    // There are 2 Leaders in both parts, we name it as l1 and l2.
     int l2 = PickIndex({RN::Leader}, 1);
     if(l2 == l1){
         l2 = PickIndex({RN::Leader}, 0);
@@ -321,17 +328,111 @@ TEST(Commit, NetworkPartition){
         std::this_thread::sleep_for(1s);
         ASSERT_LE(retry, 4);
     }
+    // Although Log3 is commited by quorum, CheckCommit still returns -1 because
+    // The other part has Log2, which will later be erased when network partition is recovered/
     ASSERT_EQ(CheckCommit(1, "3"), -1);
+    ASSERT_EQ(CheckLog(1, "3"), -1);
+    ::raft_messages::LogEntry lent;
+    nodes[l2]->get_log(1, lent);
+    ASSERT_EQ(lent.data(), "3");
+    print_state();
     
     RecoverNetworkPartition(p1, p2);
     std::this_thread::sleep_for(2s);
     printf("GTEST: Now l1 %d should be Follower, l2 %d should be Leader.\n", l1, l2);
-    // Now l2 is the leader
+    // Now l2 is the leader, becuase l2 leads the majority
     print_state();
     ASSERT_EQ(CheckCommit(1, "3"), 5);
     ASSERT_EQ(nodes[l1]->commit_index, 1);
     FreeRaftNodes();
 }
+
+
+TEST(Commit, NetworkPartition2){
+    int n = 5;
+    ASSERT_GT(n, 2);
+    MakeRaftNodes(n);
+    print_state();
+    WaitElection(nodes[0]);
+    using namespace std::chrono_literals;
+    std::this_thread::sleep_for(1s);
+    int l1 = PickIndex({RN::Leader});
+    ASSERT_NE(l1, -1);
+    
+    nodes[l1]->do_log("1");
+    std::this_thread::sleep_for(1s);
+    ASSERT_EQ(nodes[l1]->commit_index, 0);
+
+    // Network partition
+    printf("GTEST: START Network Partition\n");
+    std::vector<int> p1 = {l1, (l1+1)%n, (l1+2)%n};
+    std::vector<int> p2 = {(l1+3)%n, (l1+4)%n};
+    NetworkPartition(p1, p2);
+    printf("GTEST: Do logs[2]\n");
+    nodes[l1]->do_log("2");
+    // seq.networkpartition.checklog.log shows it is not enough
+    // std::this_thread::sleep_for(TimeEnsureNoElection());
+    std::this_thread::sleep_for(1s);
+    // Log1 is fully accepted and commited because it is before network partition.
+    ASSERT_EQ(CheckCommit(0, "1"), 5);
+    ASSERT_EQ(CheckCommit(1, "2"), 3);
+    ASSERT_EQ(CheckLog(1, "2"), 3);
+    ASSERT_EQ(nodes[l1]->commit_index, 1);
+
+    printf("GTEST: RepartitionNode, so old leader is in small part\n");
+    print_state();
+    // RepartitionNode will do its own log.
+    RepartitionNode(l1+2, {l1+3, l1+4});
+    // NOTICE In some tests, it seems that we the following a early election may not be captured by `WaitElection`
+    // WaitElection(nodes[(l1+2)%n]);
+    std::this_thread::sleep_for(TimeEnsureSuccessfulElection(6));
+    print_state();
+    ASSERT_EQ(CountLeader(), 2);
+    // There are 2 Leaders in both parts, we name it as l1 and l2.
+    int l2 = PickIndex({RN::Leader}, 1);
+    if(l2%n == l1%n){
+        l2 = PickIndex({RN::Leader}, 0);
+    }
+    ASSERT_NE(l1%n, l2%n);
+    printf("GTEST: Now new Leader %s in the other part will append log\n", nodes[l2]->name.c_str());
+    // l2 is Leader of bigger part, it can actually commit.
+    // However, old leader l1 has entry value=2
+    nodes[l2]->do_log("3");
+    int retry = 0;
+    printf("GTEST: Wait until log is commit in several rounds\n");
+    while(nodes[l2]->commit_index != 1){
+        std::this_thread::sleep_for(1s);
+        ASSERT_LE(retry, 4);
+    }
+    // Although Log3 is commited by quorum, CheckCommit still returns -1 because
+    // The other part has Log2, which will later be erased when network partition is recovered/
+    ASSERT_EQ(CheckCommit(1, "3"), -1);
+    ASSERT_EQ(CheckLog(1, "3"), -1);
+    ::raft_messages::LogEntry lent;
+    printf("GTEST: Check l2(%s)'s data\n", nodes[l2]->name.c_str());
+    print_state();
+    // TODO Check correctness!!!
+    // It should be 2. though 2 is not committed.
+    // The old leader l1 has enough time to replicate Entry[1]=2 to l2,
+    // right before it switch part.
+    nodes[l2]->get_log(1, lent);
+    ASSERT_EQ(lent.data(), "2");
+    nodes[l2]->get_log(2, lent);
+    ASSERT_EQ(lent.data(), "3");
+    print_state();
+    
+    // We should notice that l1+2 changes what it belong.
+    RecoverNetworkPartition({l1, (l1+1)%n}, {(l1+2)%n, (l1+3)%n, (l1+4)%n});
+    std::this_thread::sleep_for(2s);
+    printf("GTEST: Now l1 %d should be Leader, l2 %d should be Follower.\n", l1, l2);
+    // Now l2 is the leader, becuase l2 leads the majority
+    print_state();
+    ASSERT_EQ(CheckCommit(1, "2"), 5);
+    ASSERT_EQ(nodes[l1]->commit_index, 2);
+    ASSERT_EQ(nodes[l2]->commit_index, 2);
+    FreeRaftNodes();
+}
+
 
 TEST(Commit, LeaderChange){
     // Use part of the Figure8 in the Raft Paper
@@ -360,9 +461,70 @@ TEST(Commit, LeaderChange){
     printf("GTEST: START Network Partition\n");
     DisconnectAfterReplicateTo(nodes[l1], "2", {l1+1});
     printf("GTEST: Crash\n");
-    // NOTICE There are some Failures(logged in leaderchangestrangeblock.log and leaderchange7104delay.log) here, shows l1 replicate entry "2" to l1+1,
-    // But l1+1 doesn't respond for about 200ms(log shows no `on_append_entries_request` is handled), and a GRPC error comes very later.
+    // NOTICE There are some Failures(logged in leaderchangestrangeblock.log and leaderchange7104delay.log) here, 
+    // shows l1 replicate entry "2" to l1+1,
+    // But l1+1 doesn't respond for about 200ms(log shows no `on_append_entries_request` is handled), 
+    // and a GRPC error comes very later.
     // This problem is also mentioned in Persist.CrashAll. They may due to some gRPC calls are delayed.
+    print_state();
+    // Leader is crashed now, we don't count its vote in `CheckLog` abd `CheckCommit`.
+    ASSERT_EQ(CheckCommit(0, "1"), 4);
+    ASSERT_EQ(CheckCommit(1, "2"), 0);
+    // Only S1 and S2 has entry "2", S1 is Crashed, so only S2 have entry "2"
+    // It is possible that CheckLog(1, "2") == 1, because DisconnectAfterReplicateTo don't guarantee
+    ASSERT_EQ(CheckLog(1, "2"), 1);
+    ASSERT_EQ(nodes[l1]->commit_index, 0);
+    
+    // (b)
+    // S2-S5 timeout.
+    WaitElection(nodes[(l1+2)%n]);
+    std::this_thread::sleep_for(1s);
+    // S1 crashed. so return 1 rather than 2.
+    ASSERT_EQ(CountLeader(), 1);
+    // Now we have a new leader l2
+    int l2 = PickIndex({RN::Leader}, 0);
+    ASSERT_NE(l1%n, l2%n);
+    printf("GTEST: Old Leader %d, New Leader %d\n", l1, l2);
+    print_state();
+    // S2's wrong entry (term 2, index 2) was not removed before we DisableSend from l2 to l1+1.
+    DisconnectAfterReplicateTo(nodes[l2], "3", {});
+    print_state();
+    // Both l1+1 or other nodes can be elected as Leader, this is because:
+    // (the raft Paper) 1. Reply false if term < currentTerm (§5.1)
+    // 2. If votedFor is null or candidateId, and candidate’s log is 
+    // **at least as up-to-date as** receiver’s log, grant vote (§5.2, §5.4)
+    if(l2 % n == (l1 + 1) % n){
+        ASSERT_EQ(CheckCommit(2, "3"), 0);
+    }else{
+        // nodes[l1+1]'s log entry "2" is overwritten by nodes[l2]
+        ASSERT_EQ(CheckCommit(1, "3"), 0);
+    }
+    FreeRaftNodes();
+}
+
+
+TEST(Commit, LeaderChange2){
+    int n = 5;
+    ASSERT_GT(n, 2);
+    MakeRaftNodes(n);
+    print_state();
+    WaitElection(nodes[0]);
+    using namespace std::chrono_literals;
+    std::this_thread::sleep_for(1s);
+    int l1 = PickIndex({RN::Leader});
+    ASSERT_NE(l1, -1);
+    
+    // (a) same as LeaderChange
+    // S1 = l1, S2 = l1 + 1, ...
+    nodes[l1]->do_log("1");
+    std::this_thread::sleep_for(1s);
+    ASSERT_EQ(nodes[l1]->commit_index, 0);
+    print_state();
+
+    // S1 replicate successfully only to S2, then crashed.
+    printf("GTEST: START Network Partition\n");
+    // This function will call `do_log` and create an entry.
+    DisconnectAfterReplicateTo(nodes[l1], "2", {l1+1});
     print_state();
     // Leader is crashed now, we don't count its vote in `CheckLog` abd `CheckCommit`.
     ASSERT_EQ(CheckCommit(0, "1"), 4);
@@ -373,23 +535,41 @@ TEST(Commit, LeaderChange){
     
     // (b)
     // S2-S5 timeout.
+    printf("GTEST: START phase (b)\n");
     WaitElection(nodes[(l1+2)%n]);
     std::this_thread::sleep_for(1s);
     // S1 crashed. so return 1 rather than 2.
     ASSERT_EQ(CountLeader(), 1);
+    // Now we have a new leader l2
     int l2 = PickIndex({RN::Leader}, 0);
     ASSERT_NE(l1%n, l2%n);
     printf("GTEST: Old Leader %d, New Leader %d\n", l1, l2);
     print_state();
     // S2's wrong entry (term 2, index 2) was not removed before we DisableSend from l2 to l1+1.
-    DisconnectAfterReplicateTo(nodes[l2], "3", {});
+    nodes[l2]->do_log("3");
+    std::this_thread::sleep_for(2s);
     print_state();
+    printf("GTEST: Check nodes[l2]->commit_index is %d\n", nodes[l2]->commit_index);
     if(l2 % n == (l1 + 1) % n){
-        ASSERT_EQ(CheckCommit(2, "3"), 0);
+        // If l2 is S2, then LogEntry[1] with Value 2 can be commited
+        ASSERT_EQ(CheckLog(1, "2"), 4);
+        ASSERT_EQ(nodes[l2]->commit_index, 2);
     }else{
-        // nodes[l1+1]'s log entry "2" is overwritten by nodes[l2]
-        ASSERT_EQ(CheckCommit(1, "3"), 0);
+        // Otherwise, LogEntry[1] should be 3
+        ASSERT_EQ(CheckLog(1, "3"), 4);
+        ASSERT_EQ(nodes[l2]->commit_index, 1);
     }
+
+    RecoverFromDisconnect(nodes[l1], {l1+1});
+    std::this_thread::sleep_for(1s);
+    int cur_leader = PickIndex({RN::Leader});
+    ASSERT_EQ(cur_leader, l2);
+    nodes[l2]->do_log("4");
+    // Need more consideration...
+    // std::this_thread::sleep_for(1s);
+    // ASSERT_EQ(nodes[l2]->commit_index, 2); // maybe 3?
+    // ASSERT_EQ(nodes[l1]->commit_index, 2);
+
     FreeRaftNodes();
 }
 
@@ -882,7 +1062,7 @@ int main(int argc, char ** argv){
         FreeRaftNodes();
         return r;
     });
-    std::future_status status = future.wait_for(std::chrono::seconds(300));
+    std::future_status status = future.wait_for(std::chrono::seconds(500));
     assert(status == std::future_status::ready);
     return future.get();
 }

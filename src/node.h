@@ -66,6 +66,12 @@ typedef RaftMessagesClientSync RaftMessagesClient;
 #endif
 
 #define SEQ_START 1
+/* I don't exactly remember why this macro is here, 
+* but it may because of two implementation of removing log entries.
+* According to https://thesquareplanet.com/blog/raft-qa/,
+* my previous implemetation is not correct,
+* but seems can work correctly if we disable reorder.
+*/
 #define USE_MORE_REMOVE
 
 
@@ -636,6 +642,7 @@ struct RaftNode {
         return get_log(guard, index, l);
     }
     // Major
+    NuftResult do_log_hard(std::lock_guard<std::mutex> & guard, ::raft_messages::LogEntry entry, std::function<void(RaftNode*)> f, int command);
     NuftResult do_log(std::lock_guard<std::mutex> & guard, ::raft_messages::LogEntry entry, std::function<void(RaftNode*)> f, int command);
     NuftResult do_log(std::lock_guard<std::mutex> & guard, const std::string & log_string, std::function<void(RaftNode*)> f){
         ::raft_messages::LogEntry entry;

@@ -87,7 +87,6 @@ int RaftNode::on_append_entries_request(raft_messages::AppendEntriesResponse * r
 
     // In a earlier version, we require lock after we check `is_running()`, this may lead to segfault. See coredump_at_contains.log
     GUARD
-
     std::string peer_name = request.name();
     if((!is_running(guard)) || (!is_peer_receive_enabled(guard, peer_name))){
         #if !defined(_HIDE_NOEMPTY_REPEATED_APPENDENTRY_REQUEST) && !defined(_HIDE_PAUSED_NODE_NOTICE)
@@ -159,7 +158,9 @@ int RaftNode::on_append_entries_request(raft_messages::AppendEntriesResponse * r
     }
     if(request.prev_log_index() > get_base_index()){
         // If the Leader's prev_log_index is not compacted by me yet.
-        TermID local_term = gl(request.prev_log_index()).term();
+        // NOTICE When Network Partition happen and recover, this branch may not be executed, 
+        // because Leader in both side have the same term.
+        TermID local_term = gl(request.prev_log_index()).term(); // The leader who replicate me the last entry.
         if(request.prev_log_term() != local_term){
             // If my last logs term mismatch the Leader's. Erase to maintain Log Matching Principle.
             for(IndexID i = request.prev_log_index() - 1; i >= default_index_cursor; i--){
@@ -177,7 +178,8 @@ int RaftNode::on_append_entries_request(raft_messages::AppendEntriesResponse * r
                     response.set_last_log_term(gl(i).term());
                     // NOTICE We need to IMMEDIATELY remove! See seq.concurrent.log !!!
                     logs.erase(logs.begin() + i + 1 - get_base_index(), logs.end());
-                    // Add break according to zl951116zl(wechat) from nowcoder
+                    // Add break according to zl951116zl(wechat) from nowcoder,
+                    // Otherwise will remove until the very beginning
                     break;
                 }
                 // Otherwise continue loop
@@ -265,6 +267,8 @@ NO_CONFLICT:
         // Necessary, see https://thesquareplanet.com/blog/students-guide-to-raft/
         // assert(request.leader_commit() <= last_log_index());
         IndexID old_commit_index = commit_index;
+        // According to Figure2 Receiver Implementation 5, If leaderCommit > commitIndex, set commitIndex =
+        // min(leaderCommit, index of last new entry)
         commit_index = std::min(request.leader_commit(), last_log_index());
         debug_node("Leader %s ask me to advance commit_index from %lld to %lld, seq %llu, request.prev_log_index() %lld, last_log_index() = %lld.\n", 
             request.name().c_str(), old_commit_index, commit_index, request.seq(), request.prev_log_index(), last_log_index());
@@ -514,6 +518,11 @@ NuftResult RaftNode::do_log(std::lock_guard<std::mutex> & guard, ::raft_messages
         debug_node("Not Running!!!!\n");
         return -NUFT_FAIL;
     }
+    return do_log_hard(guard, entry, f, command);
+}
+
+
+NuftResult RaftNode::do_log_hard(std::lock_guard<std::mutex> & guard, ::raft_messages::LogEntry entry, std::function<void(RaftNode*)> f, int command){
     IndexID index = last_log_index() + 1;
     entry.set_term(this->current_term);
     entry.set_index(index);

@@ -17,6 +17,13 @@ Run all tests by
 ```
 ./test
 ```
+Run all tests until failby(This can be used to debug)
+```
+python ./src/test/test_until_fail.py
+```
+
+Some tests maybe fail, I will later revise them.
+
 # Usage
 ## API 
 1. `NuftResult RaftNode::do_log(const std::string & log_string)`

@@ -8,6 +8,7 @@ def main():
     	print "Start test -- {}".format(i)
         f = open("out.log", "w")
         returncode = subprocess.call("./test", stdin = subprocess.PIPE, stdout = f, stderr = f, shell=True)
+        # returncode = subprocess.call("./test --gtest_filter='Commit.NetworkPartition2'", stdin = subprocess.PIPE, stdout = f, stderr = f, shell=True)
         # returncode = subprocess.call("./test --gtest_filter='Election.Normal'", stdin = subprocess.PIPE, stdout = f, stderr = f, shell=True)
         # returncode = subprocess.call("./test --gtest_filter='Persist.FrequentCrash'", stdin = subprocess.PIPE, stdout = f, stderr = f, shell=True)
         # returncode = subprocess.call("./test --gtest_filter='Persist.AddPeer'", stdin = subprocess.PIPE, stdout = f, stderr = f, shell=True)

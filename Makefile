@@ -74,10 +74,10 @@ uninstall:
 	rm -rf usr/local/lib/libnuft.so
 	rm -rf usr/local/lib/libnuft.a
 
-test:
+test: $(GRPCOBJS) $(OBJS) $(SRC_ROOT)/test/test.cpp
 	make test_pure DEBUG=test
 
-test_pure: $(GRPCOBJS) $(OBJS)
+test_pure: $(GRPCOBJS) $(OBJS) $(SRC_ROOT)/test/test.cpp
 	$(CXX) $(CFLAGS) $(LOGLEVEL) $(SRC_ROOT)/test/test.cpp -o $(ROOT)/test -pthread $(GRPCOBJS) $(OBJS) /usr/local/lib/libgtest.a $(LDFLAGS)
 
 atomic:

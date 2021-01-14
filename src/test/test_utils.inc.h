@@ -27,6 +27,7 @@
 #include <unordered_set>
 #include <future>
 #include <tuple>
+#include <set>
 
 #if defined(_HIDE_TEST_DEBUG)
 #define debug_test(...)
@@ -55,8 +56,8 @@ std::chrono::duration<int, std::milli> TimeEnsureElection(){
     std::chrono::duration<int, std::milli> ms{default_timeout_interval_lowerbound};
     return ms;
 }
-std::chrono::duration<int, std::milli> TimeEnsureSuccessfulElection(){
-    std::chrono::duration<int, std::milli> ms{(default_timeout_interval_upperbound + default_election_fail_timeout_interval) * 3};
+std::chrono::duration<int, std::milli> TimeEnsureSuccessfulElection(int round=3){
+    std::chrono::duration<int, std::milli> ms{(default_timeout_interval_upperbound + default_election_fail_timeout_interval) * round};
     return ms;
 }
 std::chrono::duration<int, std::milli> TimeEnsureNoElection(){
@@ -394,7 +395,7 @@ int CheckLog(IndexID index, const std::string & value){
     for(auto nd: nodes){
         ::raft_messages::LogEntry log;
         if((!nd->is_running()) || nd->get_log(index, log) != NUFT_OK){
-            // Invalid node or no log found at index.
+            // Invalid node or no log found at index. We don't count
             if(!nd->is_running())
                 debug_test("GTEST: CheckLog: %s is not running.\n", nd->name.c_str());
             if(nd->get_log(index, log) != NUFT_OK)
@@ -407,11 +408,13 @@ int CheckLog(IndexID index, const std::string & value){
                 term = log.term();
             }else if(term != log.term()){
                 // Term conflict at index
+                debug_test("GTEST: TERM Conflict at node '%s' at %lld.\n", nd->name.c_str(), index);
                 return -1;
             }
             support++;
         }else{
             // Data conflict at index
+            debug_test("GTEST: DATA Conflict at node '%s' at Entry[%lld], which is '%s'.\n", nd->name.c_str(), index, log.data().c_str());
             return -1;
         }
     }
@@ -460,6 +463,39 @@ void NetworkPartition(std::vector<int> p1, std::vector<int> p2){
     }
 }
 
+void RepartitionNode(int node_index, std::vector<int> p1){
+    // This function parts node_index to p1,
+    // So all nodes not in p1 can not contact with node_index.
+    int N = nodes.size();
+    std::vector<std::string> sp1;
+    std::transform(p1.begin(), p1.end(), std::back_inserter(sp1), [&](int x){return std::to_string((x%N));});
+    debug_test("GTEST: RepartitionNode: move %d into part {%s}.\n", node_index%N, Nuke::join(sp1.begin(), sp1.end(), ",").c_str());
+    for(int pp1 = 0; pp1 < N; pp1++){
+        // For all node `pp1` except for `node_index`, 
+        // enable connection pp1 <-> node_index.
+        // In fact recover all connections.
+        if(pp1 != (node_index%N)){
+            nodes[pp1%N]->enable_receive(nodes[node_index%N]->name);
+            nodes[node_index%N]->enable_receive(nodes[pp1%N]->name);
+        }
+    }
+    std::set<int> pl_set;
+    std::transform(p1.begin(), p1.end(), std::inserter(pl_set, pl_set.begin()), [&](int x){return x%N;});
+    // for(auto pp1: p1){
+    //     nodes[pp1%N]->disable_receive(nodes[node_index%N]->name);
+    //     nodes[node_index%N]->disable_receive(nodes[pp1%N]->name);
+    // }
+    for(int pp1 = 0; pp1 < N; pp1++){
+        if(pl_set.count(pp1) == 0){
+            debug_test("GTEST: RepartitionNode: disable %d(%s) <-> %d(%s)\n", 
+                node_index%N, nodes[node_index%N]->name.c_str(), 
+                pp1%N, nodes[pp1%N]->name.c_str());
+            nodes[pp1%N]->disable_receive(nodes[node_index%N]->name);
+            nodes[node_index%N]->disable_receive(nodes[pp1%N]->name);
+        }
+    }
+}
+
 void RecoverNetworkPartition(std::vector<int> p1, std::vector<int> p2){
     debug_test("GTEST: RecoverNetworkPartition: part1 {%s}, part2 {%s}.\n", 
             Nuke::join(p1.begin(), p1.end(), ",", [](int x){return std::to_string(x);}).c_str(),
@@ -475,7 +511,7 @@ void RecoverNetworkPartition(std::vector<int> p1, std::vector<int> p2){
 void DisconnectAfterReplicateTo(RaftNode * leader, const std::string & log_str, std::unordered_set<int> nds){
     using namespace std::chrono_literals;
     std::unordered_set<int> mset;
-    std::vector<int> sset;
+    std::vector<int> sset; // All nodes that should be disconnected
     for(auto x: nds){
         mset.insert(x % nodes.size());
     }
@@ -492,6 +528,23 @@ void DisconnectAfterReplicateTo(RaftNode * leader, const std::string & log_str, 
     // See seq.delayed.leaderchange.log
     std::this_thread::sleep_for(TimeEnsureNoElection());
     DisableNode(leader);
+}
+
+void RecoverFromDisconnect(RaftNode * leader, std::unordered_set<int> nds){
+    using namespace std::chrono_literals;
+    std::unordered_set<int> mset;
+    std::vector<int> sset; // All nodes that should be disconnected
+    for(auto x: nds){
+        mset.insert(x % nodes.size());
+    }
+    for(int i = 0; i < nodes.size(); i++){
+        if(std::find(mset.begin(), mset.end(), i) == mset.end()){
+            sset.push_back(i);
+        }
+    }
+    debug_test("GTEST: In RecoverFromDisconnect: Mute %s\n", Nuke::join(sset.begin(), sset.end(), ";", [](int x){return std::to_string(x);}).c_str());
+    EnableSend(leader, sset);
+    EnableNode(leader);
 }
 
 int One(int index, int support){
