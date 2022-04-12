@@ -575,3 +575,40 @@ IndexID DoWhip(RaftNode * leader){
     printf("GTEST: Now Whip\n");
     return leader->do_log("Whip", NUFT_CMD_NOP);
 }
+
+
+std::unordered_set<int> RandomSet(int total){
+    std::unordered_set<int> s;
+    for(int i = 0; i < total; i++){
+        int random_number = (rand() % total);
+        s.insert(random_number);
+    }
+    return s;
+}
+
+struct NodeInvariants{
+    std::map<int, int> commit_index;
+    std::map<int, int> current_term;
+};
+
+NodeInvariants GetNodeInvariants(){
+    NodeInvariants s;
+    int n = nodes.size();
+    for(int i = 0; i < n; i++){
+        s.commit_index[i] = nodes[i]->commit_index;
+        s.current_term[i] = nodes[i]->current_term;
+    }
+    return s;
+}
+
+bool CheckNodeInvariants(NodeInvariants & old){
+    NodeInvariants cur = GetNodeInvariants();
+    int n = nodes.size();
+    for(int i = 0; i < n; i++){
+        int c1 = cur.commit_index[i];
+        int o1 = old.commit_index[i];
+        int c2 = cur.current_term[i];
+        int o2 = old.current_term[i];
+    }
+    old = cur;
+}

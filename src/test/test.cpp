@@ -573,6 +573,32 @@ TEST(Commit, LeaderChange2){
     FreeRaftNodes();
 }
 
+TEST(Commit, FrequentChange){
+    int n = 5;
+    ASSERT_GT(n, 2);
+    MakeRaftNodes(n);
+    print_state();
+    WaitElection(nodes[0]);
+    using namespace std::chrono_literals;
+    std::this_thread::sleep_for(1s);
+
+    char buf[100];
+    NodeInvariants inv = GetNodeInvariants();
+
+    for (int i = 0; i < 5; i++){
+        int l = PickIndex({RN::Leader});
+        ASSERT_NE(l, -1);
+        sprintf(buf, "%d", i);
+        DisconnectAfterReplicateTo(nodes[l], std::string(buf), RandomSet(n));
+        WaitElection(nodes[(l+1)%n]);
+        std::this_thread::sleep_for(1s);
+        ASSERT_TRUE(CheckNodeInvariants(inv));
+        RecoverFromDisconnect(nodes[l], {0, 1, 2, 3, 4, 5});
+    }
+
+    FreeRaftNodes();
+}
+
 TEST(Config, AddPeer){
     int n = 4;
     ASSERT_GT(n, 2);
