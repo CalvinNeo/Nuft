@@ -156,6 +156,9 @@ int RaftNode::on_append_entries_request(raft_messages::AppendEntriesResponse * r
         // If Leader has no entry, then we definitely not match.
         goto NO_CONFLICT;
     }
+
+    // NOTICE(2022) After all, I wonder this section may be useless, if we enable USE_MORE_REMOVE.
+    // However, I am not totally sure, since long time passed.
     if(request.prev_log_index() > get_base_index()){
         // If the Leader's prev_log_index is not compacted by me yet.
         // NOTICE When Network Partition happen and recover, this branch may not be executed, 
